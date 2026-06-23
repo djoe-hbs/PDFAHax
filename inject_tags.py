@@ -32,6 +32,25 @@ def pdf_y_to_page_y(pdf_y, page_height):
     return page_height - pdf_y
 
 
+def normalize_tags(tags_data):
+    """
+    Accept any of the tag-JSON shapes our pipeline produces:
+      1. A flat list:                    [ {block_id, tag, ...}, ... ]
+      2. The colleague-prompt object:    { "tagged_blocks": [...], "updated_tracking": {...} }
+      3. A list of per-page chunks:      [ {"tagged_blocks": [...]}, {"tagged_blocks": [...]} ]
+    Returns a flat list of tag dicts.
+    """
+    if isinstance(tags_data, dict):
+        return tags_data.get("tagged_blocks", [])
+    if isinstance(tags_data, list) and tags_data and isinstance(tags_data[0], dict) \
+            and "tagged_blocks" in tags_data[0]:
+        merged = []
+        for chunk in tags_data:
+            merged.extend(chunk.get("tagged_blocks", []))
+        return merged
+    return tags_data
+
+
 def tag_name_to_pdf_name(tag: str) -> str:
     """Convert our tag names (H1, P, LI) to PDF standard structure type names."""
     mapping = {
@@ -144,67 +163,116 @@ def match_operations_to_blocks(text_positions, page_blocks, page_height):
 
 def inject_marked_content(instructions, block_ops, tags_map, mcid_start=0):
     """
-    Insert BDC/EMC markers around groups of text operations.
-    mcid_start allows continuing MCID numbering across pages.
+    Wrap each block's text-drawing operations in BDC/EMC marked content, walking
+    the content stream IN ORDER.
 
-    Returns: new_instructions, block_to_mcid dict
+    A block whose operations are interleaved with other blocks' operations in the
+    stream (common around figures / multi-column flow) is emitted as MULTIPLE
+    marked-content runs, each with its own MCID — never one giant [min,max] range
+    that swallows the blocks drawn in between (which produced improperly nested
+    MCIDs before). Runs are also closed at ET so a sequence never crosses a text
+    object boundary.
+
+    Returns:
+        new_instructions,
+        block_to_mcids : dict block_id -> [mcid, ...] (one entry per run)
     """
-    markers = {}
-
+    # Map each op index -> block_id (excluding artifact-tagged blocks, which get
+    # no MCID and are handled by the Artifact sweep instead).
+    op_to_block = {}
     for block_id, op_indices in block_ops.items():
-        if not op_indices:
-            continue
         tag_info = tags_map.get(block_id)
-        if not tag_info:
+        if not tag_info or tag_info.get("tag", "").upper() == "ARTIFACT":
             continue
-        # Skip artifacts — they get no MCID
-        if tag_info.get("tag", "").upper() == "ARTIFACT":
-            continue
+        for idx in op_indices:
+            op_to_block[idx] = block_id
 
-        first_idx = min(op_indices)
-        last_idx = max(op_indices)
-
-        if first_idx not in markers:
-            markers[first_idx] = []
-        markers[first_idx].insert(0, ("bdc", block_id))
-
-        if last_idx not in markers:
-            markers[last_idx] = []
-        markers[last_idx].append(("emc", block_id))
-
-    # Assign MCIDs
-    block_to_mcid = {}
-    mcid = mcid_start
-    for block_id in sorted(block_ops.keys()):
-        tag_info = tags_map.get(block_id)
-        if tag_info and tag_info.get("tag", "").upper() != "ARTIFACT":
-            block_to_mcid[block_id] = mcid
-            mcid += 1
-
-    # Build new instruction list
     new_instructions = []
+    block_to_mcids = defaultdict(list)
+    mcid = mcid_start
+    open_block = None
+
+    def close_run():
+        nonlocal open_block
+        if open_block is not None:
+            new_instructions.append((pikepdf._core._ObjectList([]), pikepdf.Operator("EMC")))
+            open_block = None
+
     for idx, (operands, operator) in enumerate(instructions):
-        if idx in markers:
-            for action, block_id in markers[idx]:
-                if action == "bdc" and block_id in block_to_mcid:
-                    m = block_to_mcid[block_id]
-                    tag = tags_map[block_id].get("tag", "P")
-                    pdf_tag = tag_name_to_pdf_name(tag)
-                    bdc_operands = pikepdf._core._ObjectList([
-                        Name(f"/{pdf_tag}"),
-                        Dictionary({"/MCID": m})
-                    ])
-                    new_instructions.append((bdc_operands, pikepdf.Operator("BDC")))
+        target = op_to_block.get(idx)
 
-        new_instructions.append((operands, operator))
+        if target is not None:
+            if open_block != target:
+                close_run()
+                m = mcid
+                mcid += 1
+                pdf_tag = tag_name_to_pdf_name(tags_map[target].get("tag", "P"))
+                bdc_operands = pikepdf._core._ObjectList([
+                    Name(f"/{pdf_tag}"),
+                    Dictionary({"/MCID": m})
+                ])
+                new_instructions.append((bdc_operands, pikepdf.Operator("BDC")))
+                block_to_mcids[target].append(m)
+                open_block = target
+            new_instructions.append((operands, operator))
+        else:
+            # A marked-content sequence may not cross a text-object boundary, so
+            # close any open run before ET.
+            if str(operator) == "ET":
+                close_run()
+            new_instructions.append((operands, operator))
 
-        if idx in markers:
-            for action, block_id in markers[idx]:
-                if action == "emc" and block_id in block_to_mcid:
-                    emc_operands = pikepdf._core._ObjectList([])
-                    new_instructions.append((emc_operands, pikepdf.Operator("EMC")))
+    close_run()
+    return new_instructions, dict(block_to_mcids)
 
-    return new_instructions, block_to_mcid
+
+# Content-producing operators that PDF/UA (7.1 test 3) requires to be marked as
+# real content or as an Artifact. Positioning/state operators are excluded — they
+# draw nothing, so veraPDF does not flag them.
+_CONTENT_PAINT_OPS = {
+    "Tj", "TJ", "'", '"',                       # text showing
+    "S", "s", "f", "F", "f*", "B", "B*", "b", "b*",  # path painting
+    "Do",                                        # XObjects (images / forms)
+    "sh",                                        # shadings
+}
+
+
+def wrap_remaining_as_artifact(instructions):
+    """
+    Overlap-aware Artifact sweep.
+
+    Wrap every content-producing operator that is NOT already inside a
+    marked-content sequence in its own `/Artifact BMC ... EMC`. Depth is tracked
+    across BDC/BMC/EMC so anything already tagged (or already artifacted) is left
+    untouched — no double-marking, so this never creates nested-MCID problems.
+
+    Each content op is wrapped individually; a single atomic operator can never
+    straddle BT/ET or q/Q boundaries, so marker nesting stays valid.
+    """
+    out = []
+    depth = 0
+    wrapped = 0
+    for operands, operator in instructions:
+        op = str(operator)
+        if op in ("BDC", "BMC"):
+            depth += 1
+            out.append((operands, operator))
+            continue
+        if op == "EMC":
+            depth = max(0, depth - 1)
+            out.append((operands, operator))
+            continue
+
+        if depth <= 0 and op in _CONTENT_PAINT_OPS:
+            out.append((pikepdf._core._ObjectList([Name("/Artifact")]),
+                        pikepdf.Operator("BMC")))
+            out.append((operands, operator))
+            out.append((pikepdf._core._ObjectList([]), pikepdf.Operator("EMC")))
+            wrapped += 1
+        else:
+            out.append((operands, operator))
+
+    return out, wrapped
 
 
 # ── Structure Tree Builder (Multi-Page) ──────────────────────────────────────
@@ -215,39 +283,110 @@ def build_structure_tree(pdf, pages_data, tags_map, blocks_data):
 
     pages_data: list of (page_obj, block_to_mcid) per page
     """
+    # Index blocks by block_id so cell elems can read span/header info and
+    # TH/TD grouping can read table_id and row.
+    blocks_map = {b["block_id"]: b for b in blocks_data.get("blocks", [])}
+
     # Collect all struct elems across all pages
     all_elems = {}  # block_id -> struct_elem
 
-    for page_idx, (page, block_to_mcid) in enumerate(pages_data):
+    for page_idx, (page, block_to_mcids) in enumerate(pages_data):
         page_ref = page.obj
-        for block_id, mcid in block_to_mcid.items():
+        for block_id, mcids in block_to_mcids.items():
             tag_info = tags_map.get(block_id)
             if not tag_info:
                 continue
             tag = tag_name_to_pdf_name(tag_info.get("tag", "P"))
             alt_text = tag_info.get("alt_text")
 
-            mcr = Dictionary({
+            # One MCR per marked-content run. A block split across the stream has
+            # several runs -> /K is an array of MCRs; a single run -> just the MCR.
+            mcrs = [Dictionary({
                 "/Type": Name("/MCR"),
                 "/Pg": page_ref,
-                "/MCID": mcid
-            })
+                "/MCID": m,
+            }) for m in mcids]
+            k_value = mcrs[0] if len(mcrs) == 1 else Array(mcrs)
 
             elem_dict = {
                 "/Type": Name("/StructElem"),
                 "/S": Name(f"/{tag}"),
-                "/K": mcr,
+                "/K": k_value,
             }
             if alt_text:
                 elem_dict["/Alt"] = String(alt_text)
 
+            # PDF/UA table attributes for TH/TD cells (ISO 14289-1 7.2 / 7.5):
+            # ColSpan/RowSpan so rows resolve to equal column counts, and a
+            # Scope on header cells so headers are determinable.
+            if tag in ("TH", "TD"):
+                binfo = blocks_map.get(block_id, {})
+                col_span = int(binfo.get("col_span", 1) or 1)
+                row_span = int(binfo.get("row_span", 1) or 1)
+                attr = {"/O": Name("/Table")}
+                if col_span > 1:
+                    attr["/ColSpan"] = col_span
+                if row_span > 1:
+                    attr["/RowSpan"] = row_span
+                if tag == "TH":
+                    # Column header by default; a full-width single-cell row reads
+                    # as a column header, narrow per-row headers as Row scope.
+                    attr["/Scope"] = Name("/Column")
+                elem_dict["/A"] = Dictionary(attr)
+
             struct_elem = pdf.make_indirect(Dictionary(elem_dict))
             all_elems[block_id] = struct_elem
+
+    def build_table_subtree(t_id):
+        """
+        Build a complete Table -> TR -> TH/TD subtree for one table_id.
+
+        Cells are gathered from ALL pages with this table_id and sorted by
+        (row, col) so TR grouping and column order are correct regardless of
+        the block_id (reading-order) sequence — important for merged cells
+        whose bbox y-positions don't align cleanly within a row.
+        """
+        cells = []  # (row, col, block_id)
+        for bid in all_elems:
+            binfo = blocks_map.get(bid, {})
+            if binfo.get("table_id", -2) != t_id:
+                continue
+            tinfo = tags_map.get(bid)
+            if not tinfo or tinfo.get("tag", "").upper() not in ("TH", "TD"):
+                continue
+            cells.append((binfo.get("row", 0), binfo.get("col", 0), bid))
+
+        cells.sort(key=lambda c: (c[0], c[1]))
+
+        table_elem = pdf.make_indirect(Dictionary({
+            "/Type": Name("/StructElem"),
+            "/S": Name("/Table"),
+            "/K": Array([]),
+        }))
+
+        current_tr = None
+        current_tr_row = None
+        for row, col, bid in cells:
+            if current_tr is None or row != current_tr_row:
+                current_tr = pdf.make_indirect(Dictionary({
+                    "/Type": Name("/StructElem"),
+                    "/S": Name("/TR"),
+                    "/K": Array([]),
+                }))
+                table_elem["/K"].append(current_tr)
+                current_tr["/P"] = table_elem
+                current_tr_row = row
+            cell_elem = all_elems[bid]
+            current_tr["/K"].append(cell_elem)
+            cell_elem["/P"] = current_tr
+
+        return table_elem
 
     # Build document hierarchy respecting parent_tag grouping
     doc_kids = []
     current_list = None
     current_toc = None
+    processed_tables = set()
 
     for block_id in sorted(all_elems.keys()):
         tag_info = tags_map.get(block_id)
@@ -259,8 +398,7 @@ def build_structure_tree(pdf, pages_data, tags_map, blocks_data):
 
         # Handle TOC grouping
         if parent_tag and parent_tag.upper() == "TOC":
-            if current_list is not None:
-                current_list = None
+            current_list = None
             if current_toc is None:
                 current_toc = pdf.make_indirect(Dictionary({
                     "/Type": Name("/StructElem"),
@@ -272,8 +410,7 @@ def build_structure_tree(pdf, pages_data, tags_map, blocks_data):
             elem["/P"] = current_toc
         # Handle List grouping
         elif tag == "LI" or (parent_tag and parent_tag.upper() == "L"):
-            if current_toc is not None:
-                current_toc = None
+            current_toc = None
             if current_list is None:
                 current_list = pdf.make_indirect(Dictionary({
                     "/Type": Name("/StructElem"),
@@ -284,11 +421,20 @@ def build_structure_tree(pdf, pages_data, tags_map, blocks_data):
             current_list["/K"].append(elem)
             elem["/P"] = current_list
         elif tag == "L":
-            # A block tagged as L itself (list container with merged items)
-            if current_toc is not None:
-                current_toc = None
+            current_toc = None
             current_list = None
             doc_kids.append(elem)
+        # Handle Table grouping: build the whole Table -> TR -> TH/TD subtree once,
+        # at the position of its first cell, with cells sorted by (row, col).
+        elif tag in ("TH", "TD"):
+            current_list = None
+            current_toc = None
+            t_id = blocks_map.get(block_id, {}).get("table_id", -1)
+            if t_id in processed_tables:
+                continue  # remaining cells of this table already placed
+            processed_tables.add(t_id)
+            table_elem = build_table_subtree(t_id)
+            doc_kids.append(table_elem)
         else:
             current_list = None
             current_toc = None
@@ -307,21 +453,21 @@ def build_structure_tree(pdf, pages_data, tags_map, blocks_data):
     # Build ParentTree (NumberTree) — one entry per page
     nums_array = Array([])
 
-    for page_idx, (page, block_to_mcid) in enumerate(pages_data):
-        if not block_to_mcid:
+    for page_idx, (page, block_to_mcids) in enumerate(pages_data):
+        if not block_to_mcids:
             continue
-        max_mcid = max(block_to_mcid.values())
-        min_mcid = min(block_to_mcid.values())
 
-        # Build MCID->elem array for this page
-        mcid_refs = Array([])
-        # Create array indexed by local MCID (relative to this page's start)
+        # Map every MCID on this page (a block may own several) to its struct elem.
+        # MCIDs are per-page and 0-based, so the array is indexed directly by MCID.
         mcid_to_elem = {}
-        for block_id, mcid in block_to_mcid.items():
+        for block_id, mcids in block_to_mcids.items():
             if block_id in all_elems:
-                mcid_to_elem[mcid] = all_elems[block_id]
+                for m in mcids:
+                    mcid_to_elem[m] = all_elems[block_id]
 
-        for mcid_val in range(min_mcid, max_mcid + 1):
+        max_mcid = max(mcid_to_elem) if mcid_to_elem else -1
+        mcid_refs = Array([])
+        for mcid_val in range(0, max_mcid + 1):
             if mcid_val in mcid_to_elem:
                 mcid_refs.append(mcid_to_elem[mcid_val])
             else:
@@ -352,6 +498,14 @@ def build_structure_tree(pdf, pages_data, tags_map, blocks_data):
     pdf.Root["/StructTreeRoot"] = struct_tree_root
     pdf.Root["/MarkInfo"] = Dictionary({"/Marked": True})
 
+    # PDF/UA 7.1 test 10: ViewerPreferences must set DisplayDocTitle true so the
+    # window title shows the document title (from metadata) not the file name.
+    vp = pdf.Root.get("/ViewerPreferences")
+    if isinstance(vp, Dictionary):
+        vp["/DisplayDocTitle"] = True
+    else:
+        pdf.Root["/ViewerPreferences"] = Dictionary({"/DisplayDocTitle": True})
+
     return struct_tree_root
 
 
@@ -364,7 +518,7 @@ def inject_tags(pdf_path, blocks_json_path, tags_json_path, output_path):
     with open(blocks_json_path, 'r', encoding='utf-8') as f:
         blocks_data = json.load(f)
     with open(tags_json_path, 'r', encoding='utf-8') as f:
-        tags_data = json.load(f)
+        tags_data = normalize_tags(json.load(f))
 
     tags_map = {item["block_id"]: item for item in tags_data}
     blocks = blocks_data["blocks"]
@@ -383,60 +537,63 @@ def inject_tags(pdf_path, blocks_json_path, tags_json_path, output_path):
 
     # 3. Process each page
     pages_data = []  # list of (page_obj, block_to_mcid)
-    global_mcid = 0
     total_matched = 0
     total_injected = 0
+
+    total_artifacted = 0
 
     for page_idx in range(len(pdf.pages)):
         page = pdf.pages[page_idx]
         page_blocks = blocks_by_page.get(page_idx, [])
 
-        if not page_blocks:
-            pages_data.append((page, {}))
-            continue
-
-        # Get page height
-        mediabox = page.obj.get("/MediaBox")
-        page_height = float(mediabox[3]) if mediabox else 792.0
-
-        # Analyze content stream
+        # Analyze content stream (needed on EVERY page so the Artifact sweep can
+        # run even where nothing matched — otherwise that content stays untagged).
         instructions, text_positions = analyze_content_stream(page)
 
-        # Match operations to blocks
-        block_ops = match_operations_to_blocks(text_positions, page_blocks, page_height)
+        block_to_mcid = {}
+        if page_blocks:
+            mediabox = page.obj.get("/MediaBox")
+            page_height = float(mediabox[3]) if mediabox else 792.0
 
-        # Filter to only blocks that have tags (skip untagged or missing)
-        tagged_block_ops = {}
-        for bid, ops in block_ops.items():
-            if bid in tags_map:
-                tagged_block_ops[bid] = ops
+            block_ops = match_operations_to_blocks(text_positions, page_blocks, page_height)
+            tagged_block_ops = {bid: ops for bid, ops in block_ops.items() if bid in tags_map}
 
-        matched = len(tagged_block_ops)
-        total_matched += matched
+            matched = len(tagged_block_ops)
+            total_matched += matched
 
-        if matched == 0:
-            pages_data.append((page, {}))
-            print(f"  Page {page_idx}: 0 matches (skipped)")
-            continue
+            if matched > 0:
+                # MCIDs are numbered PER PAGE (start at 0 each page). MCID values
+                # only need to be unique within a page; the ParentTree keys content
+                # by (StructParents=page_idx, MCID). Per-page numbering keeps each
+                # page's ParentTree array indexable directly by MCID — global
+                # numbering misaligned every page after page 0.
+                instructions, block_to_mcid = inject_marked_content(
+                    instructions, tagged_block_ops, tags_map, mcid_start=0
+                )
+                injected = len(block_to_mcid)
+                total_injected += injected
+        else:
+            matched = 0
 
-        # Inject BDC/EMC markers
-        new_instructions, block_to_mcid = inject_marked_content(
-            instructions, tagged_block_ops, tags_map, mcid_start=global_mcid
-        )
+        # Artifact sweep: wrap any remaining unmarked content on this page.
+        instructions, artifacted = wrap_remaining_as_artifact(instructions)
+        total_artifacted += artifacted
 
-        injected = len(block_to_mcid)
-        total_injected += injected
-        global_mcid += injected
-
-        # Replace content stream
-        page.Contents = pdf.make_stream(pikepdf.unparse_content_stream(new_instructions))
+        # Replace content stream (every page is rewritten now).
+        page.Contents = pdf.make_stream(pikepdf.unparse_content_stream(instructions))
 
         pages_data.append((page, block_to_mcid))
-        print(f"  Page {page_idx}: {matched} matched, {injected} tagged (MCIDs {global_mcid - injected}-{global_mcid - 1})")
+        print(f"  Page {page_idx}: {matched} matched, "
+              f"{len(block_to_mcid)} tagged, {artifacted} artifacted")
 
     # 4. Build structure tree across all pages
     print(f"\n  Building StructTreeRoot across {len(pdf.pages)} pages...")
     build_structure_tree(pdf, pages_data, tags_map, blocks_data)
+
+    # 4b. PDF/UA identification (ISO 14289-1 clause 5): the XMP metadata must
+    # declare pdfuaid:part = 1.
+    with pdf.open_metadata(set_pikepdf_as_editor=False) as meta:
+        meta["pdfuaid:part"] = "1"
 
     # 5. Save
     pdf.save(output_path)
@@ -445,6 +602,7 @@ def inject_tags(pdf_path, blocks_json_path, tags_json_path, output_path):
     print(f"\n  [OK] Tagged PDF saved to: {os.path.abspath(output_path)}")
     print(f"  Total blocks matched: {total_matched}")
     print(f"  Total MCIDs injected: {total_injected}")
+    print(f"  Total content ops artifacted: {total_artifacted}")
     print(f"  Open in Adobe Acrobat -> View -> Navigation Panels -> Tags")
 
 

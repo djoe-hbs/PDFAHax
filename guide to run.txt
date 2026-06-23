@@ -1,0 +1,42 @@
+# 1. Extract
+python extract_pdf.py Final_Test_Input.pdf
+
+# 2. Detect tables
+python detect_tables.py Final_Test_Input.pdf --output table_regions.json
+
+# 3. Merge
+python merge_tables.py "output/Final_Test_Input/Final_Test_Input_structured_blocks.json" table_regions.json
+
+# 4. Send blocks_for_ai.json to the AI, get tags_merged.json back
+# (generate the slim AI input)
+python -c "
+import json
+d=json.load(open('output/Final_Test_Input/Final_Test_Input_structured_blocks_merged.json',encoding='utf-8'))
+slim=[]
+for b in d['blocks']:
+    e={'block_id':b['block_id'],'type':b['type'],'text':b['text'][:120],'bbox':b['bbox'],'metadata':b.get('metadata',{})}
+    if b['type']=='table_cell':
+        e['is_header']=b['is_header']; e['row']=b['row']; e['col']=b['col']
+    slim.append(e)
+json.dump(slim,open('blocks_for_ai.json','w'),indent=2)
+print(len(slim),'blocks')
+"
+
+# 5. Inject (after AI returns tags_merged.json)
+python inject_tags.py Final_Test_Input.pdf "output/Final_Test_Input/Final_Test_Input_structured_blocks_merged.json" tags_merged.json --output tagged_output.pdf
+
+# 6. Visualize
+python visualize_tags.py Final_Test_Input.pdf "output/Final_Test_Input/Final_Test_Input_structured_blocks_merged.json" tags_merged.json --output tagged_visual.pdf
+
+
+
+
+# 1. Re-run table detection + merge on the freshly extracted blocks
+python merge_tables.py "output/Final_Test_Input/Final_Test_Input_structured_blocks.json" table_regions.json
+
+# 2. Generate test tags (list_item -> LI, table_cell -> TH/TD, heading -> H1, else P)
+python -c "import json; d=json.load(open('output/Final_Test_Input/Final_Test_Input_structured_blocks_merged.json',encoding='utf-8')); t=[{'block_id':b['block_id'],'tag':('TH' if b.get('is_header') else 'TD') if b['type']=='table_cell' else ('LI' if b['type']=='list_item' else ('H1' if b['type']=='heading' else 'P'))} for b in d['blocks']]; json.dump(t,open('tags_merged.json','w'),indent=2); print(len(t),'tags')"
+
+# 3. Visualize
+python visualize_tags.py Final_Test_Input.pdf "output/Final_Test_Input/Final_Test_Input_structured_blocks_merged.json" tags_merged.json --output tagged_visual.pdf
+

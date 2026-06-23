@@ -1,0 +1,16 @@
+your.pdf
+   │
+   ├─ Step 1: python extract_pdf.py your.pdf
+   │           └─ output/structured_blocks.json   (plain blocks, no table info yet)
+   │
+   ├─ Step 2: python detect_tables.py your.pdf --output table_regions.json
+   │           └─ table_regions.json              (Docling's table grid)
+   │
+   ├─ Step 3: python merge_tables.py output/structured_blocks.json table_regions.json
+   │           └─ output/structured_blocks.json   (same file, now with table_cell blocks)
+   │
+   ├─ Step 4: (AI reads merged structured_blocks.json, writes tags.json)
+   │           └─ tags.json
+   │
+   └─ Step 5: python inject_tags.py your.pdf output/structured_blocks.json tags.json --output tagged.pdf
+               └─ tagged.pdf

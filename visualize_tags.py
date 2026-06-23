@@ -3,6 +3,26 @@ import json
 import os
 import fitz  # PyMuPDF
 
+
+def normalize_tags(tags_data):
+    """
+    Accept any of the tag-JSON shapes our pipeline produces:
+      1. A flat list:                    [ {block_id, tag, ...}, ... ]
+      2. The colleague-prompt object:    { "tagged_blocks": [...], "updated_tracking": {...} }
+      3. A list of per-page chunks:      [ {"tagged_blocks": [...]}, {"tagged_blocks": [...]} ]
+    Returns a flat list of tag dicts.
+    """
+    if isinstance(tags_data, dict):
+        return tags_data.get("tagged_blocks", [])
+    if isinstance(tags_data, list) and tags_data and isinstance(tags_data[0], dict) \
+            and "tagged_blocks" in tags_data[0]:
+        merged = []
+        for chunk in tags_data:
+            merged.extend(chunk.get("tagged_blocks", []))
+        return merged
+    return tags_data
+
+
 def visualize_tags(pdf_path: str, blocks_json_path: str, tags_json_path: str, output_pdf_path: str):
     """
     Takes the original PDF, the structured blocks JSON, and the AI's tags JSON,
@@ -13,7 +33,7 @@ def visualize_tags(pdf_path: str, blocks_json_path: str, tags_json_path: str, ou
         blocks_data = json.load(f)
         
     with open(tags_json_path, 'r', encoding='utf-8') as f:
-        tags_data = json.load(f)
+        tags_data = normalize_tags(json.load(f))
 
     # Create a mapping of block_id -> tag_info
     tags_map = {item["block_id"]: item for item in tags_data}
