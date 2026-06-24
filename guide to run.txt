@@ -1,14 +1,38 @@
-# 1. Extract
+==============================================================================
+ PDFAHax — PDF/UA Auto-Tagging Pipeline — RUN GUIDE
+==============================================================================
+
+Pipeline order:
+  extract -> detect tables -> merge -> AI tag -> inject -> visualize -> validate
+
+IMPORTANT: block_ids are reassigned on every extract+merge. If you re-run
+extract (step 1), you MUST re-run detect+merge (2-3) and re-tag (4) before
+inject/visualize/validate. The three move together — never mix an old
+tags_merged.json with a fresh extract.
+
+------------------------------------------------------------------------------
+ ONE-TIME SETUP (already done on this machine)
+------------------------------------------------------------------------------
+- Python deps:   pip install pymupdf pikepdf docling
+- veraPDF (PDF/UA validator) installed at:
+      C:\Users\GnanaRajaKishore\veraPDF\verapdf.bat
+  (validate_pdf.py auto-finds it; or set VERAPDF env var / pass --verapdf)
+- AI tagging prompt lives in:  prompt   (hand this + blocks_for_ai.json to the AI)
+
+
+# 1. Extract  (PyMuPDF -> structured blocks; splits list items into list_item)
 python extract_pdf.py Final_Test_Input.pdf
 
-# 2. Detect tables
+# 2. Detect tables  (Docling TableFormer -> table regions)
 python detect_tables.py Final_Test_Input.pdf --output table_regions.json
 
-# 3. Merge
+# 3. Merge  (replace in-table blocks with per-cell table_cell blocks)
 python merge_tables.py "output/Final_Test_Input/Final_Test_Input_structured_blocks.json" table_regions.json
 
-# 4. Send blocks_for_ai.json to the AI, get tags_merged.json back
-# (generate the slim AI input)
+# 4. Build the slim AI input, then send blocks_for_ai.json + the `prompt` file
+#    to the AI. Save its returned JSON as tags_merged.json
+#    (the AI output may be a flat list OR the {tagged_blocks:[...]} format —
+#     inject/visualize accept both.)
 python -c "
 import json
 d=json.load(open('output/Final_Test_Input/Final_Test_Input_structured_blocks_merged.json',encoding='utf-8'))
@@ -22,21 +46,41 @@ json.dump(slim,open('blocks_for_ai.json','w'),indent=2)
 print(len(slim),'blocks')
 "
 
-# 5. Inject (after AI returns tags_merged.json)
+# 5. Inject  (real PDF/UA tags into the PDF binary)
+#    - Tags matched text + wraps leftover content as Artifact (nothing left bare)
+#    - Per-page MCIDs + multi-run marked content (ParentTree resolves correctly)
+#    - Tables get ColSpan/RowSpan + TH Scope; sets PDF/UA id + DisplayDocTitle
 python inject_tags.py Final_Test_Input.pdf "output/Final_Test_Input/Final_Test_Input_structured_blocks_merged.json" tags_merged.json --output tagged_output.pdf
 
-# 6. Visualize
+# 6. Visualize  (draw colored tag boxes for a quick eyeball check)
 python visualize_tags.py Final_Test_Input.pdf "output/Final_Test_Input/Final_Test_Input_structured_blocks_merged.json" tags_merged.json --output tagged_visual.pdf
 
+# 7. Validate  (veraPDF PDF/UA-1 gate — prints pass/fail per rule, worst first)
+#    Saves tagged_output_verapdf.xml next to the PDF. Exit code 0 = compliant.
+python validate_pdf.py tagged_output.pdf
 
 
+==============================================================================
+ CURRENT STATUS (PDF/UA-1 on Final_Test_Input.pdf)
+==============================================================================
+101 / 106 rules pass. Remaining failures are all DEFERRED items:
+  - 4x  page-13 link annotation  (7.18.x)  -> TOC functional links task
+  - 1x  font CIDSet               (7.21.4.2) -> baked into the source PDF
 
-# 1. Re-run table detection + merge on the freshly extracted blocks
-python merge_tables.py "output/Final_Test_Input/Final_Test_Input_structured_blocks.json" table_regions.json
+Done:
+  - Figures: image Do operator now detected (CTM-tracked bbox), matched to
+    image blocks, tagged Figure w/ /Alt. All 4 figures reach the screen reader.
+  - Captions: text matching now picks the SMALLEST containing block, so small
+    captions are no longer swallowed by overlapping paragraphs. All 3 tagged.
 
-# 2. Generate test tags (list_item -> LI, table_cell -> TH/TD, heading -> H1, else P)
-python -c "import json; d=json.load(open('output/Final_Test_Input/Final_Test_Input_structured_blocks_merged.json',encoding='utf-8')); t=[{'block_id':b['block_id'],'tag':('TH' if b.get('is_header') else 'TD') if b['type']=='table_cell' else ('LI' if b['type']=='list_item' else ('H1' if b['type']=='heading' else 'P'))} for b in d['blocks']]; json.dump(t,open('tags_merged.json','w'),indent=2); print(len(t),'tags')"
+Known open work (not yet built):
+  - Nested lists (L > LI > nested L > LI): depth detection captured in
+    metadata (marker_x0/body_x0) but tree nesting not built yet.
+  - TOC functional (clickable) links: needs link annotations w/ destinations.
 
-# 3. Visualize
-python visualize_tags.py Final_Test_Input.pdf "output/Final_Test_Input/Final_Test_Input_structured_blocks_merged.json" tags_merged.json --output tagged_visual.pdf
-
+==============================================================================
+ NVDA SPOT-CHECK (hand to reviewer)
+==============================================================================
+Open tagged_output.pdf, arrow down through pages 2+. You should HEAR the actual
+words (heading text, paragraph words, each list item, table cells, figure alt
+text) — not just tag names like "heading"/"table"/"graphic".

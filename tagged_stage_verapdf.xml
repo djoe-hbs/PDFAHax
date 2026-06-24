@@ -7,11 +7,11 @@
   </buildInformation>
   <jobs>
     <job>
-      <item size="629909">
-        <name>C:\Users\GnanaRajaKishore\PDFAHax\tagged_output.pdf</name>
+      <item size="629924">
+        <name>C:\Users\GnanaRajaKishore\PDFAHax\tagged_stage.pdf</name>
       </item>
       <validationReport jobEndStatus="normal" profileName="PDF/UA-1 validation profile" statement="PDF file is not compliant with Validation Profile requirements." isCompliant="false">
-        <details passedRules="105" failedRules="1" passedChecks="47565" failedChecks="1">
+        <details passedRules="105" failedRules="1" passedChecks="47563" failedChecks="1">
           <rule specification="ISO 14289-1:2014" clause="7.21.4.2" testNumber="2" status="failed" failedChecks="1" tags="font">
             <description>If the FontDescriptor dictionary of an embedded CID font contains a CIDSet stream, then it shall identify all CIDs which are present in the font program, regardless of whether a CID in the font is referenced or used by the PDF or not</description>
             <object>PDCIDFont</object>
@@ -23,13 +23,13 @@
           </rule>
         </details>
       </validationReport>
-      <duration start="1782307663972" finish="1782307665862">00:00:01.890</duration>
+      <duration start="1782303738708" finish="1782303739874">00:00:01.166</duration>
     </job>
   </jobs>
   <batchSummary totalJobs="1" failedToParse="0" encrypted="0" outOfMemory="0" veraExceptions="0">
     <validationReports compliant="0" nonCompliant="1" failedJobs="0">1</validationReports>
     <featureReports failedJobs="0">0</featureReports>
     <repairReports failedJobs="0">0</repairReports>
-    <duration start="1782307663741" finish="1782307665957">00:00:02.216</duration>
+    <duration start="1782303738637" finish="1782303739936">00:00:01.299</duration>
   </batchSummary>
 </report>

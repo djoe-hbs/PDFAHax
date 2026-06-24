@@ -25,7 +25,7 @@ You are an expert PDF/UA Accessibility Remediation Engine. Your job is to analyz
 6. **Figures/Images**: A block with `"type": "image"` MUST be tagged as `Figure` and you MUST provide a descriptive `alt_text`. Never tag an image block as `P`.
 7. **TOC entries**: Table of Contents entries (e.g. "SECTION 1: INTRODUCTION ........ 4" lines) should be tagged as `TOCI` with `parent_tag: "TOC"`. The parent TOC container wrapping section entries should have `parent_tag: null`. Do NOT tag TOC entries as `P`.
 8. **Captions**: Image captions should be tagged as `Caption`.
-9. **Links/References**: Internal links should be tagged as `Reference` with child `Link`.
+9. Links: Do NOT tag links. Hyperlinks are wired deterministically by the injector from the PDF's existing link annotations (OBJR + StructParent). Tag the visible text by its content role (P, TOCI, etc.) and ignore its link-ness.
 10. **Continuation**: If the previous page ended mid-list or mid-paragraph, continue the structure seamlessly. Check the `overlap` file for context.
 11. **reading_order**: Must be globally sequential. Check `tracking.json` → `counters.next_reading_order` for the starting value. Increment by 1 for each non-artifact block.
 
