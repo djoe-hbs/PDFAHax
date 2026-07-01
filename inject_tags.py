@@ -371,10 +371,30 @@ def inject_marked_content(instructions, block_ops, tags_map, blocks_map, pos_x,
             new_instructions.append((pikepdf._core._ObjectList([]), pikepdf.Operator("EMC")))
             open_target = None
 
+    # Depth of PRE-EXISTING marked content in the source stream. Content already
+    # inside a source BDC/BMC (commonly /Artifact on headers/footers) must NOT be
+    # re-tagged with our own MCID — that nests tagged content inside an Artifact
+    # (ISO 14289-1 7.1 test 2). We leave such content exactly as the source had it.
+    src_depth = 0
+
     for idx, (operands, operator) in enumerate(instructions):
+        op = str(operator)
+
+        # Track source marked-content boundaries; never let our run cross one.
+        if op in ("BDC", "BMC"):
+            close_run()
+            src_depth += 1
+            new_instructions.append((operands, operator))
+            continue
+        if op == "EMC":
+            close_run()
+            src_depth = max(0, src_depth - 1)
+            new_instructions.append((operands, operator))
+            continue
+
         target = op_to_target.get(idx)
 
-        if target is not None:
+        if target is not None and src_depth == 0:
             if open_target != target:
                 close_run()
                 role, key = target
@@ -403,7 +423,7 @@ def inject_marked_content(instructions, block_ops, tags_map, blocks_map, pos_x,
             # A marked-content sequence may not cross a text-object (BT/ET) or
             # graphics-state (q/Q) boundary. Close any open run before those, so
             # e.g. an image's BDC..EMC stays within the q..Q it is painted in.
-            if str(operator) in ("BT", "ET", "q", "Q"):
+            if op in ("BT", "ET", "q", "Q"):
                 close_run()
             new_instructions.append((operands, operator))
 
