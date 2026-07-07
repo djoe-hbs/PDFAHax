@@ -352,11 +352,22 @@ def inject_marked_content(instructions, block_ops, tags_map, blocks_map, pos_x,
             for idx in op_indices:
                 op_to_target[idx] = (None, block_id)
 
-    # Link runs take priority over block assignment for their ops, so the link's
-    # visible text is tagged /Link (not absorbed into the surrounding paragraph).
+    # Link runs take priority over block assignment for ops that AREN'T a
+    # block's only content. If an op is a block's sole content, keep the block
+    # tag instead — letting a link Rect claim it would silently drop the block
+    # (0 MCIDs for blocks that were "matched"), which happens whenever a link's
+    # Rect fully covers a block's visible glyphs (e.g. an image-map style link
+    # laid over the whole page/paragraph).
     if link_groups:
+        block_only_op_count = defaultdict(int)
+        for idx, target in op_to_target.items():
+            block_only_op_count[target] += 1
+
         for gi, ops in enumerate(link_groups):
             for idx in ops:
+                existing = op_to_target.get(idx)
+                if existing is not None and block_only_op_count[existing] <= 1:
+                    continue  # this op is the block's only content — keep the block tag
                 op_to_target[idx] = ("link", gi)
 
     new_instructions = []
@@ -874,11 +885,22 @@ def inject_tags(pdf_path, blocks_json_path, tags_json_path, output_path):
 
             # Existing Link annotations: find the visible text op(s) under each
             # link's Rect so they can be tagged /Link (not absorbed by a paragraph).
+            # A block is only stripped of an op if it has OTHER ops left over —
+            # never let this empty a block out entirely. A large/overlapping link
+            # Rect (e.g. an image-map style layout) can otherwise cover a whole
+            # page's text positions and silently zero out every block's ops,
+            # which produces 0 MCIDs injected despite N blocks "matched" (matched
+            # counts dict entries, not op-list length, so the loss was invisible).
             link_groups, link_annots = collect_link_groups(page, text_positions, page_height)
             if link_groups:
                 link_idx = {i for g in link_groups for i in g}
                 for bid in list(tagged_block_ops.keys()):
-                    tagged_block_ops[bid] = [i for i in tagged_block_ops[bid] if i not in link_idx]
+                    stripped = [i for i in tagged_block_ops[bid] if i not in link_idx]
+                    if stripped:
+                        tagged_block_ops[bid] = stripped
+                    # else: keep the original ops — this block is entirely under
+                    # link Rect(s), so its own tag takes priority over splitting
+                    # out a redundant /Link run for the same text.
 
             matched = len(tagged_block_ops)
             total_matched += matched
@@ -897,6 +919,10 @@ def inject_tags(pdf_path, blocks_json_path, tags_json_path, output_path):
                 total_injected += injected
                 for gi, annot in enumerate(link_annots):
                     links_info.append({"annot": annot, "mcids": link_runs.get(gi, [])})
+                if matched > 0 and injected == 0:
+                    print(f"  [!] Page {page_idx}: {matched} block(s) matched but 0 MCIDs "
+                          f"injected — every matched block ended up with an empty op list "
+                          f"(check for oversized/overlapping Link annotation Rects).")
         else:
             matched = 0
 
@@ -906,6 +932,10 @@ def inject_tags(pdf_path, blocks_json_path, tags_json_path, output_path):
 
         # Replace content stream (every page is rewritten now).
         page.Contents = pdf.make_stream(pikepdf.unparse_content_stream(instructions))
+
+        # PDF/UA 7.18.3 / gold-standard parity: tab order follows structure on
+        # EVERY page (previously only set on pages that had link annotations).
+        page.obj["/Tabs"] = Name("/S")
 
         pages_data.append((page, block_to_runs, links_info))
         print(f"  Page {page_idx}: {matched} matched, "
