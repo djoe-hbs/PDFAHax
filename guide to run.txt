@@ -29,8 +29,19 @@ python detect_tables.py Final_Test_Input.pdf --output table_regions.json
 # 3. Merge  (replace in-table blocks with per-cell table_cell blocks)
 python merge_tables.py "output/Final_Test_Input/Final_Test_Input_structured_blocks.json" table_regions.json
 
+# 3a. Footnote candidate detection (CODE finds candidates by geometry; the AI
+#     CONFIRMS/REJECTS each one in step 4 using text context — see prompt rule
+#     9a). Writes page_N_footnote_candidates.json per page (empty list = none
+#     on that page, which is normal and requires no AI action) PLUS
+#     footnote_geometry.json (code-facing: glyph bboxes for step 5b's precise
+#     /Rect placement — the AI never sees this file, only the lean per-page one).
+#     This is a REVIEW step too: read the printed table before sending
+#     blocks_for_ai.json to the AI, so you know what candidates it will see.
+python detect_footnotes.py Final_Test_Input.pdf --blocks-json "output/Final_Test_Input/Final_Test_Input_structured_blocks_merged.json" --output footnote_pairing_map.json --candidates-dir footnote_candidates --geometry-output footnote_geometry.json
+
 # 4. Build the slim AI input, then send blocks_for_ai.json + the `prompt` file
-#    to the AI. Save its returned JSON as tags_merged.json
+#    + the relevant page_N_footnote_candidates.json file(s) to the AI. Save
+#    its returned JSON as tags_merged.json
 #    (the AI output may be a flat list OR the {tagged_blocks:[...]} format —
 #     inject/visualize accept both.)
 python -c "
@@ -50,7 +61,42 @@ print(len(slim),'blocks')
 #    - Tags matched text + wraps leftover content as Artifact (nothing left bare)
 #    - Per-page MCIDs + multi-run marked content (ParentTree resolves correctly)
 #    - Tables get ColSpan/RowSpan + TH Scope; sets PDF/UA id + DisplayDocTitle
+#    - Repairs pre-existing malformed source /Artifact marks that straddle
+#      BT/ET/q/Q (ISO 32000-2 Figure 9 violations some authoring tools write)
 python inject_tags.py Final_Test_Input.pdf "output/Final_Test_Input/Final_Test_Input_structured_blocks_merged.json" tags_merged.json --output tagged_output.pdf
+
+# 5a. TOC clickable links (OPTIONAL, two-step approve-then-build flow):
+#     Step A — build the destination map and REVIEW it before anything touches
+#     the PDF. Matches each TOCI's text to its body heading (H1-H6) by TEXT, not
+#     printed page number (which is only a sanity-check column in the table).
+python build_toc_destination_map.py "output/Final_Test_Input/Final_Test_Input_structured_blocks_merged.json" tags_merged.json --output toc_destination_map.json
+#     -> prints a review table: TOC entry | matched heading | body page | printed
+#        page | confidence (HIGH/MEDIUM/LOW/AMBIGUOUS/UNMATCHED). READ IT. An
+#        UNMATCHED entry is safe (stays a plain TOCI, no guessed link) — an
+#        AMBIGUOUS or LOW one should be checked by hand before proceeding.
+#
+#     Step B — ONLY after you've reviewed and approved toc_destination_map.json,
+#     re-run inject_tags.py with --toc-map to create the GoTo link annotations
+#     (wired TOCI -> Link -> MCR+OBJR, same mechanism as any other page link):
+python inject_tags.py Final_Test_Input.pdf "output/Final_Test_Input/Final_Test_Input_structured_blocks_merged.json" tags_merged.json --output tagged_output.pdf --toc-map toc_destination_map.json
+
+# 5b. Footnote reference links (approve-then-build, same discipline as TOC
+#     links — the map/candidates were already reviewed in step 3a; this step
+#     builds ONLY for pairs the AI actually confirmed in tags_merged.json):
+#     - Reads footnote_geometry.json (code's geometric candidates) and
+#       cross-checks each against tags_merged.json: a Reference/Note pair only
+#       gets wired if BOTH sides are AI-confirmed (tag + matching
+#       pairs_with_block_id on both). Rejected/unmatched candidates are
+#       silently skipped — no guessed link, the block stays plain text.
+#     - Builds Reference -> Link(marker MCID + OBJR) + Note -> (Lbl + body),
+#       reusing the TOC-link annotation mechanism. The marker's ops are split
+#       from the surrounding paragraph BY FONT SIZE (the superscript is its
+#       own content-stream operation, ~65% the size of body text) so the
+#       Link's MCID wraps ONLY the tiny glyph, never adjacent normal text.
+#     - REUSES a pre-existing link annotation if the source PDF already has
+#       one covering the marker glyph (common — many authoring tools already
+#       create a footnote GoTo link) instead of creating a duplicate.
+python inject_tags.py Final_Test_Input.pdf "output/Final_Test_Input/Final_Test_Input_structured_blocks_merged.json" tags_merged.json --output tagged_output.pdf --toc-map toc_destination_map.json --footnote-geometry footnote_geometry.json
 
 # 6. Visualize  (draw colored tag boxes for a quick eyeball check)
 python visualize_tags.py Final_Test_Input.pdf "output/Final_Test_Input/Final_Test_Input_structured_blocks_merged.json" tags_merged.json --output tagged_visual.pdf
@@ -63,20 +109,42 @@ python validate_pdf.py tagged_output.pdf
 ==============================================================================
  CURRENT STATUS (PDF/UA-1 on Final_Test_Input.pdf)
 ==============================================================================
-101 / 106 rules pass. Remaining failures are all DEFERRED items:
-  - 4x  page-13 link annotation  (7.18.x)  -> TOC functional links task
-  - 1x  font CIDSet               (7.21.4.2) -> baked into the source PDF
+105 / 106 rules pass. Remaining failure is DEFERRED (source PDF, not ours):
+  - 1x  font CIDSet  (7.21.4.2) -> baked into the source PDF
 
 Done:
   - Figures: image Do operator now detected (CTM-tracked bbox), matched to
     image blocks, tagged Figure w/ /Alt. All 4 figures reach the screen reader.
   - Captions: text matching now picks the SMALLEST containing block, so small
     captions are no longer swallowed by overlapping paragraphs. All 3 tagged.
-
-Known open work (not yet built):
-  - Nested lists (L > LI > nested L > LI): depth detection captured in
-    metadata (marker_x0/body_x0) but tree nesting not built yet.
-  - TOC functional (clickable) links: needs link annotations w/ destinations.
+  - Malformed source /Artifact marks (BT/ET/q/Q-straddling BDC/BMC..EMC —
+    PAC's "Operator 'BMC' not allowed in this current state") are now REPAIRED
+    in inject_tags.py, split into valid same-state sequences with the tag and
+    properties preserved. Verified byte-identical MCIDs before/after the repair.
+  - TOC clickable links: build_toc_destination_map.py (review-first) +
+    inject_tags.py --toc-map (build after approval). 49/49 matched HIGH
+    confidence on Final_Test_Input.pdf; verified MCID-stable, no ParentTree key
+    collisions, no veraPDF regression, correct /Dest per spot-check in Acrobat.
+  - Footnotes (Reference -> Link -> Note -> Lbl chain): CODE finds
+    marker/note CANDIDATE pairs by geometry (font-size ratio + raised baseline
+    + bottom-of-page position + matching number; detect_footnotes.py). The AI
+    CONFIRMS or REJECTS each candidate using text context (prompt rule 9a) and
+    emits marker_number + pairs_with_block_id on both sides. inject_tags.py
+    --footnote-geometry then builds the chain ONLY for AI-confirmed pairs —
+    code never re-decides the AI's verdict. Superscript MCID precision: the
+    marker's content-stream op is split from its paragraph by measured
+    per-op font size, so the Link's MCID wraps only the tiny glyph (verified
+    at the byte level — the BDC..EMC span contains exactly one Tj, nothing
+    else). If the source PDF already has its own link annotation on the
+    marker (common), that is REUSED rather than duplicated.
+    Proven on Final_Test_Input.pdf: 1/1 candidate found and AI-confirmed
+    correctly (page 14, "1"); direct pre/post MCID diff against a true
+    baseline (287/319 as plain P) showed exactly the 4 expected new/shifted
+    slots and zero unexplained changes anywhere else in the document;
+    ParentTree keys 0-65 all unique, no collisions; veraPDF 105/106 (same as
+    baseline — one iteration surfaced a missing Note /ID per ISO 14289-1 7.9,
+    fixed); all pre-existing structure (4 figures w/ alt-text, 2 tables, 49
+    TOCI links, headings, lists) unaffected.
 
 ==============================================================================
  NVDA SPOT-CHECK (hand to reviewer)

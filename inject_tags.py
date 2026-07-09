@@ -19,7 +19,7 @@ import argparse
 import json
 import os
 from decimal import Decimal
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 import pikepdf
 from pikepdf import Name, Dictionary, Array, String
@@ -93,6 +93,102 @@ def _mat_mul(m1, m2):
 def _mat_apply(m, x, y):
     a, b, c, d, e, f = m
     return (a * x + c * y + e, b * x + d * y + f)
+
+
+# Operators that bound a "state region" a marked-content sequence must not cross,
+# per ISO 32000-2 Figure 9 (BDC/BMC opened in one text/graphics state and EMC'd
+# in another is invalid syntax).
+_STATE_BOUNDARY_OPS = {"BT", "ET", "q", "Q"}
+
+
+def repair_straddling_source_marks(instructions):
+    """
+    Fix PRE-EXISTING malformed marked-content in the SOURCE content stream: any
+    BDC/BMC..EMC sequence whose open and close are separated by a BT/ET/q/Q is
+    invalid per ISO 32000-2 Figure 9 (this is what PAC reports as "Operator 'BMC'
+    not allowed in this current state"). Some PDF authoring tools (observed here:
+    Word/Acrobat pagination tagging) write /Artifact spans this way.
+
+    Fix: split each straddling sequence into multiple shorter sequences, one per
+    state region, each opened with the SAME tag name and property dictionary
+    (so /Artifact + /Attached + /Type /Pagination etc. are preserved verbatim)
+    and closed before the next boundary operator, then reopened after it.
+
+    SCOPE — deliberately narrow:
+    - Only sequences whose open/close straddle a boundary are touched. A source
+      sequence that is already valid (opens and closes within one state region)
+      is left completely alone.
+    - This function runs BEFORE our own tag injection (inject_marked_content)
+      and BEFORE the Artifact sweep (wrap_remaining_as_artifact) ever sees the
+      stream, on the RAW source instructions — so it can only ever be splitting
+      sequences that were already present in the source. It has no interaction
+      with MCIDs: Artifact-tagged marked content never carries an /MCID key (that
+      is only ever added by inject_marked_content for OUR tag runs), so splitting
+      these spans cannot renumber, shift, or duplicate any MCID our structure
+      tree depends on.
+
+    Returns: (new_instructions, n_repaired) where n_repaired counts the source
+    sequences that were split (0 if the source stream had none).
+    """
+    # First pass: find which BDC/BMC opens are matched by an EMC that is
+    # separated by at least one state-boundary operator.
+    stack = []          # indices of currently-open BDC/BMC (source-level only)
+    to_split = set()    # open_idx of sequences that need splitting
+    for idx, (operands, operator) in enumerate(instructions):
+        op = str(operator)
+        if op in ("BDC", "BMC"):
+            stack.append(idx)
+        elif op == "EMC":
+            if not stack:
+                continue
+            open_idx = stack.pop()
+            crosses = any(
+                str(instructions[j][1]) in _STATE_BOUNDARY_OPS
+                for j in range(open_idx + 1, idx)
+            )
+            if crosses:
+                to_split.add(open_idx)
+
+    if not to_split:
+        return instructions, 0
+
+    # Second pass: rebuild the stream, splitting flagged sequences at each
+    # boundary operator into close/reopen pairs with identical tag+properties.
+    out = []
+    active_tag = None  # (operands, operator) of the currently-open split sequence
+    n_repaired = 0
+    depth_stack = []   # tracks open_idx values in source order (mirrors pass 1)
+
+    for idx, (operands, operator) in enumerate(instructions):
+        op = str(operator)
+
+        if op in ("BDC", "BMC"):
+            depth_stack.append(idx)
+            out.append((operands, operator))
+            if idx in to_split:
+                active_tag = (operands, operator)
+                n_repaired += 1
+            continue
+
+        if op == "EMC":
+            if depth_stack:
+                open_idx = depth_stack.pop()
+                if open_idx in to_split:
+                    active_tag = None
+            out.append((operands, operator))
+            continue
+
+        if op in _STATE_BOUNDARY_OPS and active_tag is not None:
+            # Close the split sequence before the boundary, emit the boundary,
+            # then reopen with the identical tag+properties right after.
+            out.append((pikepdf._core._ObjectList([]), pikepdf.Operator("EMC")))
+            out.append((operands, operator))
+            out.append(active_tag)
+            continue
+
+        out.append((operands, operator))
+
+    return out, n_repaired
 
 
 def analyze_content_stream(page):
@@ -301,7 +397,8 @@ def collect_link_groups(page, text_positions, page_height):
 # ── Content Stream Injection ─────────────────────────────────────────────────
 
 def inject_marked_content(instructions, block_ops, tags_map, blocks_map, pos_x,
-                          link_groups=None, mcid_start=0):
+                          link_groups=None, mcid_start=0, pos_font_size=None,
+                          footnote_pairs=None):
     """
     Wrap each block's text-drawing operations in BDC/EMC marked content, walking
     the content stream IN ORDER.
@@ -319,28 +416,51 @@ def inject_marked_content(instructions, block_ops, tags_map, blocks_map, pos_x,
     Inline markers that share a text op with the body are NOT split (fall back to
     a single LI run).
 
+    FOOTNOTE MARKER SPLIT (superscript precision): for a block tagged Reference
+    that has an AI-confirmed footnote pairing, its ops are split by FONT SIZE
+    (not x-position — the marker sits inline within the same line as the
+    sentence, not to its left): any op whose font_size is <= a marker_ratio_max
+    fraction of the block's own dominant font size is the tiny superscript
+    glyph ("marker" role); everything else is ordinary sentence text
+    ("para_text" role, tagged P — the surrounding prose is not part of the
+    footnote reference itself). Symmetrically, a block tagged Note splits its
+    leading small-font label op ("note_lbl") from the note body ("note_body").
+    This is exactly how the real content stream is shaped: the marker "1" is
+    its own separate Tj/TJ operation at 6.48pt inside a 9.96pt-dominant line,
+    so splitting by measured per-op font size wraps ONLY that tiny glyph's MCID
+    — never the adjacent normal-size text.
+
     Returns:
         new_instructions,
         block_to_runs : dict block_id -> [(role, mcid), ...]
-                        role is None (normal), "lbl" (bullet) or "lbody" (body).
+                        role is None (normal), "lbl"/"lbody" (list),
+                        "marker"/"para_text" (Reference), or
+                        "note_lbl"/"note_body" (Note).
     """
+    footnote_pairs = footnote_pairs or {}  # block_id -> "reference" | "note"
+    MARKER_RATIO_MAX = 0.85  # matches detect_footnotes.py's SIZE_RATIO_MAX
+
     # Map each op index -> target key. Target is (role, block_id); role is None
-    # for normal blocks, "lbl"/"lbody" for split list items. Artifact-tagged
-    # blocks are excluded (handled by the Artifact sweep).
+    # for normal blocks, "lbl"/"lbody" for split list items, "marker"/"para_text"
+    # for Reference blocks, "note_lbl"/"note_body" for Note blocks. Artifact-
+    # tagged blocks are excluded (handled by the Artifact sweep).
     op_to_target = {}
     for block_id, op_indices in block_ops.items():
         tag_info = tags_map.get(block_id)
         if not tag_info or tag_info.get("tag", "").upper() == "ARTIFACT":
             continue
+        block_tag = tag_info.get("tag", "").upper()
 
         blk = blocks_map.get(block_id, {})
         meta = blk.get("metadata", {})
         marker_x0 = meta.get("marker_x0")
         body_x0 = meta.get("body_x0")
-        splittable = (tag_info.get("tag", "").upper() == "LI"
+        splittable = (block_tag == "LI"
                       and blk.get("type") == "list_item"
                       and marker_x0 is not None and body_x0 is not None
                       and (body_x0 - marker_x0) > 3)
+
+        footnote_role = footnote_pairs.get(block_id)  # "reference" | "note" | None
 
         if splittable:
             threshold = body_x0 - 3
@@ -348,6 +468,20 @@ def inject_marked_content(instructions, block_ops, tags_map, blocks_map, pos_x,
                 x = pos_x.get(idx)
                 role = "lbl" if (x is not None and x < threshold) else "lbody"
                 op_to_target[idx] = (role, block_id)
+        elif footnote_role in ("reference", "note") and pos_font_size:
+            sizes = [pos_font_size[idx] for idx in op_indices if idx in pos_font_size]
+            if sizes:
+                dom_size = Counter(sizes).most_common(1)[0][0]
+            else:
+                dom_size = None
+            small_role = "marker" if footnote_role == "reference" else "note_lbl"
+            normal_role = "para_text" if footnote_role == "reference" else "note_body"
+            for idx in op_indices:
+                fs = pos_font_size.get(idx)
+                if dom_size and fs is not None and fs <= dom_size * MARKER_RATIO_MAX:
+                    op_to_target[idx] = (small_role, block_id)
+                else:
+                    op_to_target[idx] = (normal_role, block_id)
         else:
             for idx in op_indices:
                 op_to_target[idx] = (None, block_id)
@@ -417,6 +551,14 @@ def inject_marked_content(instructions, block_ops, tags_map, blocks_map, pos_x,
                     pdf_tag = "Span"
                 elif role == "lbody":
                     pdf_tag = "LBody"
+                elif role == "marker":
+                    pdf_tag = "Link"      # the superscript glyph itself lives in <Link>
+                elif role == "para_text":
+                    pdf_tag = "P"         # surrounding sentence, NOT part of <Reference>
+                elif role == "note_lbl":
+                    pdf_tag = "Lbl"
+                elif role == "note_body":
+                    pdf_tag = "Note"      # note body's own tag (Lbl is nested separately)
                 else:
                     pdf_tag = tag_name_to_pdf_name(tags_map[key].get("tag", "P"))
                 bdc_operands = pikepdf._core._ObjectList([
@@ -516,13 +658,241 @@ def wrap_remaining_as_artifact(instructions):
     return out, wrapped
 
 
+# ── TOC destination links ─────────────────────────────────────────────────────
+
+def create_toc_link_annotations(pdf, pages_data, dest_map, blocks_map):
+    """
+    Create one GoTo link annotation per approved TOC destination-map entry,
+    reusing the exact mechanism already proven for pre-existing page links
+    (Link StructElem -> [MCR(visible text), OBJR(annotation)], /StructParent,
+    ParentTree, /Tabs /S) — the only difference is these annotations are newly
+    created here rather than pre-existing in the source PDF.
+
+    dest_map: list of entries (see toc_destination_map.json) with at least
+      toc_block_id, matched_heading_block_id, matched_page_idx, matched_top_y,
+      toc_text. Entries with matched_heading_block_id == None (unmatched) are
+      skipped entirely — per the safeguard, no guessed link is ever created.
+
+    Returns: links_by_page : {page_idx: [ {"annot":.., "toc_block_id":..}, ... ]}
+      to be merged into each page's links_info before build_structure_tree
+      wires them into the tree.
+    """
+    links_by_page = defaultdict(list)
+    page_objs = [p for p, _, _ in pages_data]
+
+    for entry in dest_map:
+        if entry.get("matched_heading_block_id") is None:
+            continue  # unmatched — leave as plain TOCI, no guessed link
+
+        toc_bid = entry["toc_block_id"]
+        toc_block = blocks_map.get(toc_bid)
+        if not toc_block or not toc_block.get("bbox"):
+            continue
+
+        dest_page_idx = entry["matched_page_idx"]
+        if dest_page_idx >= len(page_objs):
+            continue
+        dest_page_obj = page_objs[dest_page_idx].obj
+
+        toc_page_idx = toc_block["page_idx"]
+        if toc_page_idx >= len(page_objs):
+            continue
+
+        # /Rect over the TOCI entry text, in PDF (bottom-left origin) coords —
+        # the block bbox is stored top-left, so flip Y using that page's height.
+        toc_page_obj = page_objs[toc_page_idx].obj
+        mb = toc_page_obj.get("/MediaBox")
+        toc_page_h = float(mb[3]) if mb else 792.0
+        bx0, by0, bx1, by1 = toc_block["bbox"]
+        rect = Array([bx0, toc_page_h - by1, bx1, toc_page_h - by0])
+
+        # /Dest: GoTo the matched heading's page, positioned at its top-y (XYZ,
+        # left unchanged (null), top = heading's top-y converted to PDF coords).
+        dmb = dest_page_obj.get("/MediaBox")
+        dest_page_h = float(dmb[3]) if dmb else 792.0
+        top_y = entry.get("matched_top_y")
+        dest_top_pdf = (dest_page_h - top_y) if top_y is not None else dest_page_h
+        dest_array = Array([dest_page_obj, Name("/XYZ"), pikepdf.Object.parse(b"null"), dest_top_pdf, 0])
+
+        annot = pdf.make_indirect(Dictionary({
+            "/Type": Name("/Annot"),
+            "/Subtype": Name("/Link"),
+            "/Rect": rect,
+            "/Border": Array([0, 0, 0]),   # invisible border — purely a nav aid
+            "/Dest": dest_array,
+            "/Contents": String(toc_block["text"].strip()),
+        }))
+
+        toc_page_annots = toc_page_obj.get("/Annots")
+        if toc_page_annots is None:
+            toc_page_obj["/Annots"] = Array([annot])
+        else:
+            toc_page_annots.append(annot)
+
+        links_by_page[toc_page_idx].append({"annot": annot, "toc_block_id": toc_bid})
+
+    return links_by_page
+
+
+# ── Footnote (Reference -> Note) destination links ──────────────────────────
+
+def create_footnote_link_annotations(pdf, pages_data, footnote_geometry, tags_map, blocks_map):
+    """
+    Create one GoTo link annotation per AI-CONFIRMED footnote pair, reusing the
+    same mechanism as create_toc_link_annotations — the only structural
+    difference is WHERE the /Rect sits.
+
+    TOC links use the whole TOCI block's bbox (the entire visible line is the
+    clickable target). A footnote reference is different: only the tiny
+    superscript GLYPH is the navigable target, not the sentence it sits in —
+    so /Rect here is footnote_geometry's marker_bbox (captured by
+    detect_footnotes.py from the raw PyMuPDF span, NOT the containing block's
+    full paragraph bbox). This is the geometric half of "superscript MCID
+    precision": the clickable area and the MCID it wraps must both cover only
+    that ~3.3x8.6pt glyph.
+
+    footnote_geometry: dict block_id_marker(str) -> {block_id_note, marker_bbox,
+      note_label_bbox, page_idx, ...} from detect_footnotes.py's
+      --geometry-output. This is CODE'S geometric candidate data.
+
+    TRUST BOUNDARY: a geometric candidate only becomes a link if the AI
+    ALSO confirmed it — i.e. tags_map[block_id_marker]["tag"] == "Reference"
+    AND tags_map[block_id_note]["tag"] == "Note" AND both sides'
+    pairs_with_block_id cross-reference each other. A geometric candidate the
+    AI rejected (left as plain P, no Reference/Note tag) never reaches here —
+    code trusts the AI's confirm/reject verdict, it does not re-decide it.
+
+    Returns: links_by_page : {page_idx: [ {"annot":.., "marker_block_id":..,
+      "note_block_id":.., "marker_mcid_role": "marker"}, ... ]}
+    """
+    links_by_page = defaultdict(list)
+    page_objs = [p for p, _, _ in pages_data]
+
+    for marker_bid_str, geo in footnote_geometry.items():
+        marker_bid = int(marker_bid_str)
+        note_bid = geo["block_id_note"]
+
+        marker_tag_info = tags_map.get(marker_bid)
+        note_tag_info = tags_map.get(note_bid)
+        if not marker_tag_info or not note_tag_info:
+            continue
+        if str(marker_tag_info.get("tag", "")).upper() != "REFERENCE":
+            continue  # AI rejected or retagged — no guessed link
+        if str(note_tag_info.get("tag", "")).upper() != "NOTE":
+            continue
+        # Cross-reference check: both sides must confirm the SAME pairing (the
+        # AI could in principle confirm block 287 as Reference paired with a
+        # DIFFERENT note than geometry proposed — trust the AI's own pairing,
+        # not geometry's, when they disagree).
+        if marker_tag_info.get("pairs_with_block_id") != note_bid:
+            continue
+        if note_tag_info.get("pairs_with_block_id") != marker_bid:
+            continue
+
+        marker_block = blocks_map.get(marker_bid)
+        note_block = blocks_map.get(note_bid)
+        if not marker_block or not note_block:
+            continue
+
+        marker_page_idx = marker_block["page_idx"]
+        note_page_idx = note_block["page_idx"]
+        if marker_page_idx >= len(page_objs) or note_page_idx >= len(page_objs):
+            continue
+
+        # /Rect over ONLY the tiny superscript glyph (marker_bbox), not the
+        # paragraph — top-left bbox flipped to PDF bottom-left coords.
+        marker_page_obj = page_objs[marker_page_idx].obj
+        mb = marker_page_obj.get("/MediaBox")
+        marker_page_h = float(mb[3]) if mb else 792.0
+        bx0, by0, bx1, by1 = geo["marker_bbox"]
+        rect = Array([bx0, marker_page_h - by1, bx1, marker_page_h - by0])
+
+        marker_text = geo.get("number", "")
+
+        # REUSE a pre-existing link annotation if the source PDF already has
+        # one covering the marker glyph, instead of creating a redundant
+        # duplicate at the same Rect. Some source documents already carry
+        # author-created footnote links (observed on Final_Test_Input.pdf page
+        # 13 — the author's own annotation's Rect matched the marker glyph
+        # almost exactly). Match by Rect containment of the marker glyph's
+        # bbox center, restricted to /Subtype /Link annotations.
+        existing_annot = None
+        rmx0, rmy0, rmx1, rmy1 = float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3])
+        mcx, mcy = (rmx0 + rmx1) / 2, (rmy0 + rmy1) / 2
+        page_annots = marker_page_obj.get("/Annots")
+        if page_annots:
+            for a in page_annots:
+                if a.get("/Subtype") != Name("/Link"):
+                    continue
+                r = a.get("/Rect")
+                if r is None or len(r) != 4:
+                    continue
+                ax0, ay0, ax1, ay1 = (float(r[0]), float(r[1]), float(r[2]), float(r[3]))
+                if ax0 - 1 <= mcx <= ax1 + 1 and ay0 - 1 <= mcy <= ay1 + 1:
+                    existing_annot = a
+                    break
+
+        if existing_annot is not None:
+            # Reuse as-is: keep the source's own Rect/Dest untouched (it is the
+            # document author's own footnote link — more authoritative than
+            # anything we would compute), just ensure /Contents exists for
+            # PDF/UA 7.18.1/7.18.5 (alternate description requirement).
+            annot = existing_annot
+            if "/Contents" not in annot:
+                annot["/Contents"] = String(f"Footnote {marker_text}")
+        else:
+            # No pre-existing annotation to reuse — create one, same as TOC links.
+            note_page_obj = page_objs[note_page_idx].obj
+            nmb = note_page_obj.get("/MediaBox")
+            note_page_h = float(nmb[3]) if nmb else 792.0
+            note_label_bbox = geo.get("note_label_bbox")
+            note_top_y = note_label_bbox[1] if note_label_bbox else note_block["bbox"][1]
+            dest_top_pdf = note_page_h - note_top_y
+            dest_array = Array([note_page_obj, Name("/XYZ"), pikepdf.Object.parse(b"null"),
+                                dest_top_pdf, 0])
+
+            annot = pdf.make_indirect(Dictionary({
+                "/Type": Name("/Annot"),
+                "/Subtype": Name("/Link"),
+                "/Rect": rect,
+                "/Border": Array([0, 0, 0]),
+                "/Dest": dest_array,
+                "/Contents": String(f"Footnote {marker_text}"),
+            }))
+            marker_page_annots = marker_page_obj.get("/Annots")
+            if marker_page_annots is None:
+                marker_page_obj["/Annots"] = Array([annot])
+            else:
+                marker_page_annots.append(annot)
+
+        links_by_page[marker_page_idx].append({
+            "annot": annot,
+            "marker_block_id": marker_bid,
+            "note_block_id": note_bid,
+            "marker_number": marker_text,
+        })
+
+    return links_by_page
+
+
 # ── Structure Tree Builder (Multi-Page) ──────────────────────────────────────
 
-def build_structure_tree(pdf, pages_data, tags_map, blocks_data):
+def build_structure_tree(pdf, pages_data, tags_map, blocks_data, toc_links_by_page=None,
+                         footnote_links_by_page=None):
     """
     Build the full PDF logical structure tree across all pages.
 
     pages_data: list of (page_obj, block_to_mcid) per page
+    toc_links_by_page: optional {page_idx: [{"annot":.., "toc_block_id":..}]}
+      from create_toc_link_annotations — wires TOCI -> Link -> (MCR + OBJR)
+      instead of leaving TOCI as a plain text element.
+    footnote_links_by_page: optional {page_idx: [{"annot":.., "marker_block_id":..,
+      "note_block_id":..}]} from create_footnote_link_annotations — wires the
+      Reference block's marker MCID into a Link (OBJR + MCR) instead of leaving
+      it a bare child of Reference. A Reference block with NO matching entry
+      here (AI rejected it, or geometry/AI disagreed) still gets its marker
+      MCID directly under Reference — degraded but valid PDF/UA structure, not
+      a build failure.
     """
     # Index blocks by block_id so cell elems can read span/header info and
     # TH/TD grouping can read table_id and row.
@@ -531,13 +901,23 @@ def build_structure_tree(pdf, pages_data, tags_map, blocks_data):
     # Collect all struct elems across all pages, plus a per-page map from MCID to
     # the DEEPEST struct elem holding it (the element whose /K is that MCR). For a
     # split list item that is the Span (bullet) or LBody (body), not the LI.
-    all_elems = {}            # block_id -> top-level struct_elem
-    page_mcid_elem = []       # index == page_idx -> {mcid: struct_elem}
-    link_records = []         # (annot, link_elem, page) for ParentTree + StructParent
+    all_elems = {}              # block_id -> top-level struct_elem
+    page_mcid_elem = []         # index == page_idx -> {mcid: struct_elem}
+    link_records = []           # (annot, link_elem, page) for ParentTree + StructParent
+    toc_link_records = []       # same, for newly-created TOC destination links
+    footnote_link_records = []  # same, for newly-created footnote marker->note links
+    reference_para_elems = {}   # Reference block_id -> its sibling <P> elem (prose text)
+    reference_marker_mcids = {} # Reference block_id -> [marker mcid, ...] (pre-Link)
+    note_elem_by_block_id = {}  # Note block_id -> its built <Note> struct_elem
+    notes_nested_in_reference = set()  # Note block_ids re-parented into a Reference
+    toc_links_by_page = toc_links_by_page or {}
+    footnote_links_by_page = footnote_links_by_page or {}
 
     for page_idx, (page, block_to_runs, links_info) in enumerate(pages_data):
         page_ref = page.obj
         mcid_elem = {}
+        page_toc_links = toc_links_by_page.get(page_idx, [])
+        page_footnote_links = footnote_links_by_page.get(page_idx, [])
 
         def mcr(m):
             return Dictionary({"/Type": Name("/MCR"), "/Pg": page_ref, "/MCID": m})
@@ -591,6 +971,90 @@ def build_structure_tree(pdf, pages_data, tags_map, blocks_data):
                 all_elems[block_id] = li_elem
                 continue
 
+            # ── Footnote Reference: <P>(surrounding sentence) sibling to
+            # Reference -> Link(marker MCID + OBJR) ──
+            # The AI tags the WHOLE paragraph block Reference, but only the
+            # tiny superscript glyph belongs inside <Reference>/<Link> — the
+            # sentence text around it is ordinary prose. inject_marked_content
+            # already split this block's ops into "marker" (the superscript,
+            # its own MCID) and "para_text" (everything else) by font size.
+            #
+            # all_elems[block_id] stays the Reference elem (a single elem, like
+            # every other block_id) so every downstream consumer of all_elems
+            # keeps working unchanged. The optional prose-P sibling is tracked
+            # separately in reference_para_elems and spliced in immediately
+            # BEFORE the Reference when doc_kids is built (same reading-order
+            # position, since both came from the same source block).
+            if tag == "Reference" and any(role in ("marker", "para_text") for role, _ in runs):
+                marker_mcids = [m for role, m in runs if role == "marker"]
+                para_mcids = [m for role, m in runs if role in ("para_text", None)]
+
+                if para_mcids:
+                    para_elem = pdf.make_indirect(Dictionary({
+                        "/Type": Name("/StructElem"), "/S": Name("/P"), "/K": k_of(para_mcids),
+                    }))
+                    for m in para_mcids:
+                        mcid_elem[m] = para_elem
+                    reference_para_elems[block_id] = para_elem
+
+                ref_elem = pdf.make_indirect(Dictionary({
+                    "/Type": Name("/StructElem"), "/S": Name("/Reference"),
+                    "/K": k_of(marker_mcids) if marker_mcids else Array([]),
+                }))
+                for m in marker_mcids:
+                    # SAFE DEFAULT: marker MCID resolves directly to Reference.
+                    # If create_footnote_link_annotations() produced a
+                    # confirmed annotation for this block_id, the
+                    # page_footnote_links handling right below REPLACES this
+                    # with Reference -> Link -> MCR+OBJR and remaps mcid_elem
+                    # to the Link. A Reference with no confirmed annotation
+                    # (shouldn't happen if the AI only tags Reference on
+                    # confirmed pairs, but degrade safely if it does) is still
+                    # valid PDF/UA structure — just without the clickable jump.
+                    mcid_elem[m] = ref_elem
+                if marker_mcids:
+                    reference_marker_mcids[block_id] = marker_mcids
+
+                all_elems[block_id] = ref_elem
+                continue
+
+            # ── Footnote Note: Note -> (Lbl[note_lbl MCID] + note body MCID(s)) ──
+            if tag == "Note" and any(role in ("note_lbl", "note_body") for role, _ in runs):
+                lbl_mcids = [m for role, m in runs if role == "note_lbl"]
+                body_mcids = [m for role, m in runs if role in ("note_body", None)]
+
+                # PDF/UA (ISO 14289-1 7.9 test 1): a Note struct element MUST
+                # carry a unique /ID so it can be cross-referenced (e.g. from
+                # the marker's Reference back to this exact note). Derived from
+                # block_id, which is already unique per document.
+                note_elem = pdf.make_indirect(Dictionary({
+                    "/Type": Name("/StructElem"), "/S": Name("/Note"), "/K": Array([]),
+                    "/ID": pikepdf.String(f"note-{block_id}"),
+                }))
+                note_kids = []
+
+                if lbl_mcids:
+                    lbl_elem = pdf.make_indirect(Dictionary({
+                        "/Type": Name("/StructElem"), "/S": Name("/Lbl"), "/K": k_of(lbl_mcids),
+                    }))
+                    lbl_elem["/P"] = note_elem
+                    note_kids.append(lbl_elem)
+                    for m in lbl_mcids:
+                        mcid_elem[m] = lbl_elem
+
+                if body_mcids:
+                    # Body MCIDs attach directly to Note (no extra wrapper —
+                    # matches the target structure: Note -> Lbl + body MCIDs).
+                    for mc in body_mcids:
+                        note_kids.append(mcr(mc))
+                    for m in body_mcids:
+                        mcid_elem[m] = note_elem
+
+                note_elem["/K"] = Array(note_kids)
+                all_elems[block_id] = note_elem
+                note_elem_by_block_id[block_id] = note_elem
+                continue
+
             # ── Normal block (P/H/Figure/Caption/TH/TD/LI-without-split/...) ──
             mcids = [m for _, m in runs]
             elem_dict = {
@@ -623,6 +1087,78 @@ def build_structure_tree(pdf, pages_data, tags_map, blocks_data):
             all_elems[block_id] = struct_elem
             for m in mcids:
                 mcid_elem[m] = struct_elem
+
+            # TOC clickable link: nest TOCI -> Link -> (MCR(entry text) + OBJR
+            # (annotation)), same pattern as a pre-existing page link, just with
+            # a NEWLY CREATED annotation and placed one level deeper (inside the
+            # TOCI element) instead of at Document level. Only TOCI blocks that
+            # matched a body heading in the approved destination map get here —
+            # create_toc_link_annotations() already filtered out unmatched ones.
+            if tag == "TOCI" and page_toc_links:
+                toc_link = next(
+                    (tl for tl in page_toc_links if tl["toc_block_id"] == block_id), None
+                )
+                if toc_link is not None:
+                    annot = toc_link["annot"]
+                    objr = pdf.make_indirect(Dictionary({"/Type": Name("/OBJR"), "/Obj": annot}))
+                    link_elem = pdf.make_indirect(Dictionary({
+                        "/Type": Name("/StructElem"),
+                        "/S": Name("/Link"),
+                        "/K": Array([k_of(mcids), objr]),
+                        "/P": struct_elem,
+                    }))
+                    for m in mcids:
+                        mcid_elem[m] = link_elem  # deepest owner of the MCID is now the Link
+                    struct_elem["/K"] = link_elem  # TOCI's only child is the Link
+                    # /Contents was already set at annotation-creation time.
+                    toc_link_records.append((annot, link_elem, page))
+
+        # ── Footnote reference links: nest Reference -> Link(marker MCID +
+        # OBJR) ──, replacing the SAFE-DEFAULT marker->Reference mapping set
+        # above with marker->Link, same pattern as the TOCI link nesting.
+        # page_footnote_links only contains entries create_footnote_link_
+        # annotations() already restricted to AI-CONFIRMED Reference/Note
+        # pairs (rejected/unmatched candidates never produced an annotation),
+        # so no additional confirm/reject logic is needed here — this loop
+        # trusts that upstream filtering completely.
+        for fl in page_footnote_links:
+            marker_bid = fl["marker_block_id"]
+            marker_mcids = reference_marker_mcids.get(marker_bid)
+            ref_elem = all_elems.get(marker_bid)
+            if not marker_mcids or ref_elem is None:
+                continue  # Reference block wasn't on this page's block_to_runs; skip
+
+            annot = fl["annot"]
+            objr = pdf.make_indirect(Dictionary({"/Type": Name("/OBJR"), "/Obj": annot}))
+            link_elem = pdf.make_indirect(Dictionary({
+                "/Type": Name("/StructElem"),
+                "/S": Name("/Link"),
+                "/Alt": String(fl.get("marker_number", "")),
+                "/K": Array([k_of(marker_mcids), objr]),
+                "/P": ref_elem,
+            }))
+            for m in marker_mcids:
+                mcid_elem[m] = link_elem  # deepest owner of the marker MCID is now the Link
+
+            # Re-parent the paired <Note> INSIDE <Reference>, as a sibling of
+            # <Link> (gold-standard target: Reference -> [Link, Note]), instead
+            # of leaving it hoisted to Document level. note_elem was already
+            # fully built (Note -> Lbl + body MCIDs) when its own block_id was
+            # processed earlier in this same page loop, or an earlier page's —
+            # note_elem_by_block_id is shared across the whole pages_data pass,
+            # so lookups work regardless of which page built it.
+            note_bid = fl.get("note_block_id")
+            note_elem = note_elem_by_block_id.get(note_bid) if note_bid is not None else None
+            ref_kids = [link_elem]
+            if note_elem is not None:
+                note_elem["/P"] = ref_elem
+                ref_kids.append(note_elem)
+
+            ref_elem["/K"] = Array(ref_kids) if len(ref_kids) > 1 else link_elem
+            link_elem["/P"] = ref_elem
+            footnote_link_records.append((annot, link_elem, page))
+            if note_elem is not None:
+                notes_nested_in_reference.add(note_bid)
 
         # ── Existing Link annotations on this page ──
         # Link -> [ MCR(visible text) ..., OBJR(annotation) ]. The annotation is
@@ -745,12 +1281,48 @@ def build_structure_tree(pdf, pages_data, tags_map, blocks_data):
             processed_tables.add(t_id)
             table_elem = build_table_subtree(t_id)
             doc_kids.append(table_elem)
+        elif tag == "REFERENCE":
+            current_list = None
+            current_toc = None
+            # Gold-standard target: Reference is a CHILD of the surrounding
+            # paragraph's <P>, inline at the point in reading order where the
+            # superscript marker sits — NOT a sibling hoisted to Document level.
+            # The AI tagged the whole source paragraph as one block_id (the
+            # marker/prose split is superscript-glyph precision inside the
+            # content stream, not a document-structure split), so para_elem's
+            # own body MCID(s) already read as the sentence; appending elem
+            # (Reference) after them places the marker exactly where it trails
+            # that sentence.
+            para_elem = reference_para_elems.get(block_id)
+            if para_elem is not None:
+                existing_k = para_elem["/K"]
+                para_kids = list(existing_k) if isinstance(existing_k, pikepdf.Array) else [existing_k]
+                para_kids.append(elem)
+                para_elem["/K"] = Array(para_kids)
+                elem["/P"] = para_elem
+                doc_kids.append(para_elem)  # /P (Document) set below, for para_elem only
+            else:
+                # No surrounding-prose sibling was split out (e.g. the marker
+                # was the block's only content) — degrade safely to the old
+                # Document-level placement rather than lose the Reference.
+                doc_kids.append(elem)
+        elif tag == "NOTE" and block_id in notes_nested_in_reference:
+            # Already re-parented inside its Reference (as a sibling of Link)
+            # when the footnote link was built above — do not ALSO hoist it to
+            # Document level, which would double-place the same struct_elem.
+            current_list = None
+            current_toc = None
+            continue
         else:
             current_list = None
             current_toc = None
             doc_kids.append(elem)
 
-    # Place Link elements in the document tree (under Document).
+    # Place pre-existing-annotation Link elements in the document tree (under
+    # Document). TOC destination links are NOT placed here — their link_elem is
+    # already nested inside the owning TOCI element's /K (set above), so adding
+    # them to doc_kids too would duplicate them in the tree. TOC links still need
+    # their own /P set for the parent chain to resolve correctly.
     for _annot, link_elem, _page in link_records:
         doc_kids.append(link_elem)
 
@@ -791,8 +1363,21 @@ def build_structure_tree(pdf, pages_data, tags_map, blocks_data):
     # index (0..N-1) and map to an ARRAY of per-MCID parents. Annotation entries
     # are keyed by /StructParent (a fresh integer after the page keys) and map to
     # a SINGLE parent struct elem (the Link). Both kinds coexist in /Nums.
+    # TOC destination-link annotations use this SAME counter/keyspace, so their
+    # /StructParent values continue on from pre-existing links with no collision
+    # (each annotation gets one fresh integer; page keys 0..N-1 are already used).
     struct_parent_key = len(pages_data)
     for annot, link_elem, _page in link_records:
+        annot["/StructParent"] = struct_parent_key
+        nums_array.append(struct_parent_key)
+        nums_array.append(link_elem)
+        struct_parent_key += 1
+    for annot, link_elem, _page in toc_link_records:
+        annot["/StructParent"] = struct_parent_key
+        nums_array.append(struct_parent_key)
+        nums_array.append(link_elem)
+        struct_parent_key += 1
+    for annot, link_elem, _page in footnote_link_records:
         annot["/StructParent"] = struct_parent_key
         nums_array.append(struct_parent_key)
         nums_array.append(link_elem)
@@ -830,14 +1415,42 @@ def build_structure_tree(pdf, pages_data, tags_map, blocks_data):
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-def inject_tags(pdf_path, blocks_json_path, tags_json_path, output_path):
-    """Main multi-page injection pipeline."""
+def inject_tags(pdf_path, blocks_json_path, tags_json_path, output_path, toc_map_path=None,
+                footnote_geometry_path=None):
+    """
+    Main multi-page injection pipeline.
+
+    toc_map_path: optional path to an APPROVED toc_destination_map.json (see
+      build_toc_destination_map.py). When given, a GoTo link annotation is
+      created for every entry with a matched_heading_block_id, wired as
+      TOCI -> Link -> (MCR + OBJR), reusing the same ParentTree/StructParent
+      mechanism as pre-existing page links. Entries with no match are left as
+      plain TOCI — never a guessed link.
+
+    footnote_geometry_path: optional path to footnote_geometry.json (see
+      detect_footnotes.py --geometry-output). Contains CODE's geometric
+      candidates (marker/note bboxes), keyed by block_id_marker. A candidate
+      only produces a Reference->Link->Note chain if the AI ALSO confirmed it
+      in tags_json (tag=="Reference"/"Note" with matching pairs_with_block_id
+      on both sides) — code trusts the AI's confirm/reject verdict here, it
+      does not re-decide it. Rejected/unmatched candidates stay plain text.
+    """
 
     # 1. Load data
     with open(blocks_json_path, 'r', encoding='utf-8') as f:
         blocks_data = json.load(f)
     with open(tags_json_path, 'r', encoding='utf-8') as f:
         tags_data = normalize_tags(json.load(f))
+
+    toc_dest_map = None
+    if toc_map_path:
+        with open(toc_map_path, 'r', encoding='utf-8') as f:
+            toc_dest_map = json.load(f)
+
+    footnote_geometry = None
+    if footnote_geometry_path:
+        with open(footnote_geometry_path, 'r', encoding='utf-8') as f:
+            footnote_geometry = json.load(f)
 
     tags_map = {item["block_id"]: item for item in tags_data}
     blocks = blocks_data["blocks"]
@@ -855,16 +1468,44 @@ def inject_tags(pdf_path, blocks_json_path, tags_json_path, output_path):
     print(f"  Total blocks: {len(blocks)}")
     print(f"  Total tags: {len(tags_data)}")
 
+    # 2b. AI-CONFIRMED footnote pairs (block_id -> "reference" | "note"), used
+    # by inject_marked_content to split a block's ops by font size (superscript
+    # marker vs. surrounding prose; note label vs. note body). Built directly
+    # from tags_json's tag + pairs_with_block_id fields — independent of
+    # footnote_geometry, since the split must happen for ANY AI-confirmed
+    # Reference/Note block even if --footnote-geometry wasn't passed (the
+    # block still needs correct MCID splitting; only the clickable /Dest
+    # annotation additionally needs the geometry file).
+    footnote_pairs_map = {}
+    for bid, t in tags_map.items():
+        tg = str(t.get("tag", "")).upper()
+        if tg == "REFERENCE" and t.get("pairs_with_block_id") is not None:
+            footnote_pairs_map[bid] = "reference"
+        elif tg == "NOTE" and t.get("pairs_with_block_id") is not None:
+            footnote_pairs_map[bid] = "note"
+
     # 3. Process each page
     pages_data = []  # list of (page_obj, block_to_mcid)
     total_matched = 0
     total_injected = 0
 
     total_artifacted = 0
+    total_repaired = 0
 
     for page_idx in range(len(pdf.pages)):
         page = pdf.pages[page_idx]
         page_blocks = blocks_by_page.get(page_idx, [])
+
+        # Repair pre-existing malformed marked-content in the SOURCE stream
+        # (ISO 32000-2 Figure 9 violations, e.g. a source /Artifact BDC..EMC
+        # straddling BT/ET/q/Q) BEFORE anything else reads the stream, so every
+        # downstream instruction index (text/image positions, our own MCID
+        # injection) is computed against the already-repaired instruction list.
+        raw_instructions = list(pikepdf.parse_content_stream(page))
+        raw_instructions, repaired = repair_straddling_source_marks(raw_instructions)
+        total_repaired += repaired
+        if repaired:
+            page.Contents = pdf.make_stream(pikepdf.unparse_content_stream(raw_instructions))
 
         # Analyze content stream (needed on EVERY page so the Artifact sweep can
         # run even where nothing matched — otherwise that content stays untagged).
@@ -894,6 +1535,27 @@ def inject_tags(pdf_path, blocks_json_path, tags_json_path, output_path):
             link_groups, link_annots = collect_link_groups(page, text_positions, page_height)
             if link_groups:
                 link_idx = {i for g in link_groups for i in g}
+                # AI-confirmed footnote marker/note ops are EXCLUDED from generic
+                # link stripping, even if a pre-existing link annotation's Rect
+                # happens to cover them (this happens when the source PDF already
+                # has its own author-created footnote link on the marker glyph —
+                # observed on Final_Test_Input.pdf page 13). Reference/Note
+                # handling must get first claim on these ops so the superscript
+                # glyph's MCID isn't silently absorbed into a bare generic /Link
+                # with no Reference parent. create_footnote_link_annotations()
+                # separately detects and REUSES that same pre-existing annotation
+                # (rather than creating a redundant duplicate) when its Rect
+                # matches the marker glyph — see that function's docstring.
+                footnote_op_idx = {
+                    idx for bid in tagged_block_ops if bid in footnote_pairs_map
+                    for idx in tagged_block_ops[bid]
+                }
+                link_idx -= footnote_op_idx
+                # Also strip those ops out of link_groups itself (the list
+                # inject_marked_content receives) — otherwise its OWN internal
+                # link-priority pass (op_to_target overridden to "link") would
+                # reclaim them independently of the stripping done here.
+                link_groups = [[i for i in g if i not in footnote_op_idx] for g in link_groups]
                 for bid in list(tagged_block_ops.keys()):
                     stripped = [i for i in tagged_block_ops[bid] if i not in link_idx]
                     if stripped:
@@ -911,9 +1573,11 @@ def inject_tags(pdf_path, blocks_json_path, tags_json_path, output_path):
                 # by (StructParents=page_idx, MCID). Per-page numbering keeps each
                 # page's ParentTree array indexable directly by MCID.
                 pos_x = {p["idx"]: p["x"] for p in text_positions}
+                pos_font_size = {p["idx"]: p["font_size"] for p in text_positions}
                 instructions, block_to_runs, link_runs = inject_marked_content(
                     instructions, tagged_block_ops, tags_map, blocks_map, pos_x,
-                    link_groups=link_groups, mcid_start=0
+                    link_groups=link_groups, mcid_start=0,
+                    pos_font_size=pos_font_size, footnote_pairs=footnote_pairs_map,
                 )
                 injected = len(block_to_runs)
                 total_injected += injected
@@ -940,11 +1604,36 @@ def inject_tags(pdf_path, blocks_json_path, tags_json_path, output_path):
         pages_data.append((page, block_to_runs, links_info))
         print(f"  Page {page_idx}: {matched} matched, "
               f"{len(block_to_runs)} tagged, {artifacted} artifacted"
+              + (f", {repaired} source-mark repair(s)" if repaired else "")
               + (f", {len(links_info)} link(s)" if links_info else ""))
+
+    # 3b. TOC destination links (approved map only — see toc_map_path docstring).
+    toc_links_by_page = {}
+    if toc_dest_map:
+        toc_links_by_page = create_toc_link_annotations(pdf, pages_data, toc_dest_map, blocks_map)
+        n_toc_links = sum(len(v) for v in toc_links_by_page.values())
+        n_unmatched = sum(1 for e in toc_dest_map if e.get("matched_heading_block_id") is None)
+        print(f"  TOC links: {n_toc_links} created, {n_unmatched} left unmatched (no guessed link)")
+
+    # 3c. Footnote reference links (AI-confirmed pairs only — see
+    # footnote_geometry_path docstring). Only candidates where BOTH the
+    # Reference and Note blocks were tagged (with matching pairs_with_block_id)
+    # by the AI produce an annotation; geometry-only candidates the AI rejected
+    # are silently skipped by create_footnote_link_annotations.
+    footnote_links_by_page = {}
+    if footnote_geometry:
+        footnote_links_by_page = create_footnote_link_annotations(
+            pdf, pages_data, footnote_geometry, tags_map, blocks_map
+        )
+        n_fn_links = sum(len(v) for v in footnote_links_by_page.values())
+        n_fn_candidates = len(footnote_geometry)
+        print(f"  Footnote links: {n_fn_links} created (AI-confirmed) of "
+              f"{n_fn_candidates} geometric candidate(s)")
 
     # 4. Build structure tree across all pages
     print(f"\n  Building StructTreeRoot across {len(pdf.pages)} pages...")
-    build_structure_tree(pdf, pages_data, tags_map, blocks_data)
+    build_structure_tree(pdf, pages_data, tags_map, blocks_data, toc_links_by_page,
+                         footnote_links_by_page)
 
     # 4b. PDF/UA identification (ISO 14289-1 clause 5): the XMP metadata must
     # declare pdfuaid:part = 1.
@@ -959,6 +1648,7 @@ def inject_tags(pdf_path, blocks_json_path, tags_json_path, output_path):
     print(f"  Total blocks matched: {total_matched}")
     print(f"  Total MCIDs injected: {total_injected}")
     print(f"  Total content ops artifacted: {total_artifacted}")
+    print(f"  Total source marked-content sequences repaired: {total_repaired}")
     print(f"  Open in Adobe Acrobat -> View -> Navigation Panels -> Tags")
 
 
@@ -970,6 +1660,12 @@ if __name__ == "__main__":
     parser.add_argument("blocks_json", help="structured_blocks.json from extraction")
     parser.add_argument("tags_json", help="AI-generated tags JSON")
     parser.add_argument("--output", default="tagged_output.pdf", help="Output PDF path")
+    parser.add_argument("--toc-map", default=None,
+                        help="Approved toc_destination_map.json (creates TOC GoTo links)")
+    parser.add_argument("--footnote-geometry", default=None,
+                        help="footnote_geometry.json from detect_footnotes.py --geometry-output "
+                            "(creates footnote GoTo links for AI-confirmed Reference/Note pairs)")
 
     args = parser.parse_args()
-    inject_tags(args.pdf_path, args.blocks_json, args.tags_json, args.output)
+    inject_tags(args.pdf_path, args.blocks_json, args.tags_json, args.output, args.toc_map,
+               args.footnote_geometry)

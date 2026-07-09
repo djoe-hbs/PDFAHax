@@ -26,6 +26,21 @@ You are an expert PDF/UA Accessibility Remediation Engine. Your job is to analyz
 7. **TOC entries**: Table of Contents entries (e.g. "SECTION 1: INTRODUCTION ........ 4" lines) should be tagged as `TOCI` with `parent_tag: "TOC"`. The parent TOC container wrapping section entries should have `parent_tag: null`. Do NOT tag TOC entries as `P`.
 8. **Captions**: Image captions should be tagged as `Caption`.
 9. Links: Do NOT tag links. Hyperlinks are wired deterministically by the injector from the PDF's existing link annotations (OBJR + StructParent). Tag the visible text by its content role (P, TOCI, etc.) and ignore its link-ness.
+   🔶 9a. **Footnotes (candidates pre-detected by code — you CONFIRM, you do not detect):** The blocks JSON cannot show you font size or baseline position at the sub-character level, so code has already found every place where a tiny, raised digit in one block's text numerically matches a tiny, leading digit in a bottom-of-page block's text elsewhere on the same page. Each such pair is listed for you in `footnote_candidates.json` (see WHAT YOU RECEIVE below) as `{block_id_marker, block_id_note, number}`.
+     For each candidate pair, read BOTH blocks' full text and decide: **is this a genuine footnote reference, or a coincidental digit match?**
+     - **Genuine footnote** — the marker sits at the end of a claim/statement that plausibly needs a citation or clarifying aside, and the note block reads as an explanatory aside about that claim (often starting "See...", qualifying a policy, adding an exception, citing a source). → Confirm it: tag the marker block's `tag` as `"Reference"` with a `marker_number` field (the digit, as a string) and `pairs_with_block_id` (the note's block_id). Tag the note block's `tag` as `"Note"` with the same `marker_number` and `pairs_with_block_id` (the marker's block_id).
+     - **NOT a footnote** — the digit is a math exponent, an ordinal (1st/2nd written as a raised "st"/"nd" companion), a chemical/unit notation, or the "matching" bottom-of-page digit is unrelated content (e.g. a page number, a list item, a coincidental number) that doesn't read as an explanation of the marker's sentence. → REJECT the pairing: tag both blocks normally by their actual role (usually `P`) and do NOT use `Reference`/`Note`. Do not partially confirm — a rejected candidate gets no footnote tags on either side.
+     - When in doubt, prefer rejecting. A missed footnote (left as plain `P`) is a minor accessibility gap; a wrongly-confirmed footnote (or a real footnote wrongly rejected) produces an incorrect navigable link. Note in your `notes` field WHY you confirmed or rejected each candidate.
+
+     **Worked example 1 — genuine footnote (CONFIRM):**
+     Marker block text: `"...provided based on the following calculations:1"` — the "1" is the last character, immediately after a colon introducing something that needs elaboration.
+     Note block text: `"1 The vacation policy applies to all regular full-time and part-time employees."` — starts with "1", then a sentence that reads as a clarifying rule about who the preceding claim applies to.
+     → CONFIRM. Marker block: `tag: "Reference", marker_number: "1", pairs_with_block_id: <note's id>`. Note block: `tag: "Note", marker_number: "1", pairs_with_block_id: <marker's id>`.
+
+     **Worked example 2 — NOT a footnote (REJECT):**
+     Marker block text: `"...the standard deviation formula uses x2 to represent the squared term"` — the "2" is a math exponent baked into a formula description, not a citation.
+     "Matching" block text (candidate note, same page, bottom region): `"2 Employees hired after this date follow the revised schedule."` — this is actually an unrelated real footnote for a DIFFERENT marker elsewhere on the page; it does not explain the exponent sentence at all.
+     → REJECT. Tag both blocks normally (`P`). Do not create `Reference`/`Note` tags for this pair — leave a note explaining the "2" is a math exponent, not a citation.
 10. **Continuation**: If the previous page ended mid-list or mid-paragraph, continue the structure seamlessly. Check the `overlap` file for context.
 11. **reading_order**: Must be globally sequential. Check `tracking.json` → `counters.next_reading_order` for the starting value. Increment by 1 for each non-artifact block.
 
@@ -47,6 +62,8 @@ You are an expert PDF/UA Accessibility Remediation Engine. Your job is to analyz
 3. **`tracking.json`**: Current state of the tagging process across all pages.
 
 4. **`output_format_template.json`**: The exact JSON schema your output must follow.
+
+5. 🔶 **`footnote_candidates.json`**: Pre-detected footnote-marker/footnote-body candidate pairs for this page (code found these by font size + baseline geometry — see rule 9a). Each entry: `{"block_id_marker": <id>, "block_id_note": <id>, "number": "1"}`. Empty list if this page has none. You do not need to search for footnotes yourself — only judge the candidates given.
 
 ### WHAT YOU MUST RETURN
 
@@ -81,6 +98,28 @@ Return ONLY valid JSON. No markdown, no explanations, no commentary. The JSON mu
       "parent_tag": "L",
       "role": "listitem",
       "notes": "List item - marker captured in metadata"
+    },
+    {
+      "block_id": 287,
+      "tag": "Reference",
+      "alt_text": null,
+      "reading_order": 88,
+      "parent_tag": null,
+      "role": "reference",
+      "marker_number": "1",
+      "pairs_with_block_id": 319,
+      "notes": "Confirmed footnote candidate: marker ends a sentence introducing a calculation, note block explains it (rule 9a example 1)"
+    },
+    {
+      "block_id": 319,
+      "tag": "Note",
+      "alt_text": null,
+      "reading_order": 89,
+      "parent_tag": null,
+      "role": "footnote",
+      "marker_number": "1",
+      "pairs_with_block_id": 287,
+      "notes": "Confirmed footnote body, pairs with block 287"
     }
   ],
   "updated_tracking": {
