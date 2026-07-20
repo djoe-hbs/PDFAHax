@@ -26,6 +26,9 @@ models/
 # Zip files
 *.zip
 
+# Secrets
+.env
+
 # IDE
 .vscode/
 .idea/

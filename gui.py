@@ -55,6 +55,7 @@ from inject_tags import inject_tags, normalize_tags
 from visualize_tags import visualize_tags
 from add_bookmarks import add_bookmarks
 from validate_pdf import find_verapdf, _local, _find, _findall
+from ai_tagger import tag_document
 
 ctk.set_appearance_mode("system")
 ctk.set_default_color_theme("blue")
@@ -218,6 +219,9 @@ class PDFATaggerApp(ctk.CTk):
         self.save_blocks_btn.pack(side="left")
         self.copy_prompt_btn = ctk.CTkButton(btn_row, text="Copy AI prompt", command=self._copy_prompt)
         self.copy_prompt_btn.pack(side="left", padx=8)
+        self.auto_tag_btn = ctk.CTkButton(btn_row, text="\u2728 Auto-Tag with Gemini", command=self._start_auto_tag, state="disabled",
+                                          fg_color="#6c47d9", hover_color="#5535b8")
+        self.auto_tag_btn.pack(side="left", padx=8)
 
         self.p1_progress_label = ctk.CTkLabel(p1_frame, text="", anchor="w")
         self.p1_progress_label.pack(fill="x", padx=8)
@@ -319,6 +323,7 @@ class PDFATaggerApp(ctk.CTk):
         self._set_textbox(self.blocks_ai_box, job.blocks_for_ai_text)
         self.copy_blocks_btn.configure(state="normal" if job.blocks_for_ai_text else "disabled")
         self.save_blocks_btn.configure(state="normal" if job.blocks_for_ai_text else "disabled")
+        self.auto_tag_btn.configure(state="normal" if job.phase1_done else "disabled")
 
         self.tags_box.delete("1.0", "end")
         # tags_box holds per-job pasted text; stash it on the job itself.
@@ -495,6 +500,89 @@ class PDFATaggerApp(ctk.CTk):
             text = f.read()
         self._copy_text(text)
         self._set_status("Copied AI tagging prompt to clipboard.", "success")
+
+    # ── Auto-Tag with Gemini ─────────────────────────────────────────────
+    def _start_auto_tag(self):
+        job = self.current_job
+        if not job or not job.phase1_done:
+            self._set_status("Run 'Extract & Prepare' for this file first.", "error")
+            return
+        if not job.merged_json_path:
+            self._set_status("Merged blocks not found — run Phase 1 again.", "error")
+            return
+
+        self.auto_tag_btn.configure(state="disabled")
+        self.extract_btn.configure(state="disabled")
+        self.extract_all_btn.configure(state="disabled")
+        self._set_status(f"Auto-tagging {job.name} with Gemini...")
+        self.p1_progress.set(0)
+        threading.Thread(target=self._auto_tag_worker, args=(job,), daemon=True).start()
+
+    def _auto_tag_worker(self, job):
+        try:
+            with open(job.merged_json_path, "r", encoding="utf-8") as f:
+                merged = json.load(f)["blocks"]
+
+            # Determine footnote candidates dir (if it exists alongside the merged JSON)
+            fn_dir = os.path.join(job.doc_dir, "footnote_candidates") if job.doc_dir else None
+            if fn_dir and not os.path.isdir(fn_dir):
+                fn_dir = None
+
+            total_pages = len(set(b["page_idx"] for b in merged))
+
+            def progress_cb(page_idx, total, status):
+                if page_idx >= 0:
+                    frac = (page_idx + 1) / total if total else 0
+                    self.after(0, self._auto_tag_progress, frac, status)
+                else:
+                    self.after(0, self._auto_tag_progress, 1.0, status)
+
+            tags = tag_document(
+                merged,
+                footnote_candidates_dir=fn_dir,
+                progress_cb=progress_cb,
+            )
+
+            tags_text = json.dumps(tags, indent=2)
+            self.after(0, self._auto_tag_done, job, tags_text)
+
+        except Exception as e:
+            err_msg = f"{type(e).__name__}: {e}"
+            print(traceback.format_exc(), file=sys.stderr)
+            self.after(0, self._auto_tag_failed, job, err_msg)
+
+    def _auto_tag_progress(self, fraction, status_text):
+        self.p1_progress.set(fraction)
+        self.p1_progress_label.configure(text=status_text)
+
+    def _auto_tag_done(self, job, tags_text):
+        # Fill the tags box with the AI's response
+        self.tags_box.delete("1.0", "end")
+        self.tags_box.insert("1.0", tags_text)
+        job._pasted_tags_text = tags_text
+        job.tags_pasted = True
+
+        self.auto_tag_btn.configure(state="normal")
+        self.extract_btn.configure(state="normal")
+        self.extract_all_btn.configure(state="normal")
+        self.p1_progress.set(1.0)
+        self._set_status(
+            f"\u2705 {job.name} auto-tagged successfully! "
+            f"Review the tags below, then click 'Inject Tags & Finish'.",
+            "success",
+        )
+
+    def _auto_tag_failed(self, job, error_msg):
+        self.auto_tag_btn.configure(state="normal")
+        self.extract_btn.configure(state="normal")
+        self.extract_all_btn.configure(state="normal")
+        self.p1_progress.set(0)
+        self.p1_progress_label.configure(text="Auto-tag failed")
+        self._set_status(
+            f"Auto-tag failed for {job.name}: {error_msg}\n"
+            f"You can still paste tags manually.",
+            "error",
+        )
 
     # ── Manual step: load tags from file ────────────────────────────────
     def _load_tags_file(self):
