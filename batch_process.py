@@ -141,6 +141,14 @@ def resolve_tags(merged_blocks, pdf_path, tagger_spec, flags):
       "dir:<folder>"  -> <folder>/<stem>.tags.json if present, else placeholder
                           + an 'awaiting_ai_tags' flag so the row is reviewable.
     """
+    if tagger_spec == "gemini":
+        from ai_tagger import tag_document
+        fn_dir = os.path.join(os.path.dirname(pdf_path), "footnote_candidates")
+        if not os.path.isdir(fn_dir):
+            fn_dir = None
+        tags = tag_document(merged_blocks, footnote_candidates_dir=fn_dir)
+        return tags, True
+
     if tagger_spec.startswith("dir:"):
         ai_dir = tagger_spec[4:]
         stem = os.path.splitext(os.path.basename(pdf_path))[0]
@@ -320,7 +328,7 @@ def main() -> int:
     ap.add_argument("input_folder", help="Folder containing PDFs to process")
     ap.add_argument("--output-dir", required=True, help="Output/mirror folder")
     ap.add_argument("--tagger", default="placeholder",
-                    help="'placeholder' (default) or 'dir:<folder-of-Doc.tags.json>'")
+                    help="'gemini' (auto-tag via Gemini API), 'placeholder' (default), or 'dir:<folder-of-Doc.tags.json>'")
     ap.add_argument("--resume", action="store_true",
                     help="Skip files that already fully completed in a prior run")
     ap.add_argument("--no-verapdf", action="store_true", help="Skip veraPDF (faster)")
