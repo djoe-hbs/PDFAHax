@@ -206,7 +206,14 @@ class PDFATaggerApp(ctk.CTk):
         # Phase 1
         p1_frame = ctk.CTkFrame(body)
         p1_frame.pack(fill="x", **pad)
-        ctk.CTkLabel(p1_frame, text="Phase 1 — Prepare (steps 1-4)", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=8, pady=(8, 0))
+        header_row = ctk.CTkFrame(p1_frame, fg_color="transparent")
+        header_row.pack(fill="x", padx=8, pady=(8, 0))
+        ctk.CTkLabel(header_row, text="Phase 1 — Prepare (steps 1-4)", font=ctk.CTkFont(weight="bold")).pack(side="left")
+        
+        ctk.CTkLabel(header_row, text="Table Engine:").pack(side="left", padx=(20, 8))
+        self.engine_select = ctk.CTkOptionMenu(header_row, values=["Docling", "OpenDataLoader"], width=150)
+        self.engine_select.pack(side="left")
+        
         btn_row = ctk.CTkFrame(p1_frame, fg_color="transparent")
         btn_row.pack(fill="x", padx=8, pady=6)
         self.extract_btn = ctk.CTkButton(btn_row, text="Extract & Prepare (this file)", command=self._start_extract)
@@ -349,21 +356,23 @@ class PDFATaggerApp(ctk.CTk):
         if not self.current_job:
             messagebox.showinfo("No PDF", "Choose PDF(s) first.")
             return
-        self._run_phase1([self.current_job])
+        engine = self.engine_select.get().lower()
+        self._run_phase1([self.current_job], engine)
 
     def _start_extract_all(self):
         if not self.jobs:
             messagebox.showinfo("No PDF", "Choose PDF(s) first.")
             return
-        self._run_phase1(self.jobs)
+        engine = self.engine_select.get().lower()
+        self._run_phase1(self.jobs, engine)
 
-    def _run_phase1(self, jobs):
+    def _run_phase1(self, jobs, engine):
         self.extract_btn.configure(state="disabled")
         self.extract_all_btn.configure(state="disabled")
         self.p1_progress.set(0)
         self.p1_progress_label.configure(text=f"0 / {len(jobs)} prepared")
-        self._set_status(f"Preparing {len(jobs)} file(s) ...")
-        threading.Thread(target=self._phase1_worker, args=(jobs,), daemon=True).start()
+        self._set_status(f"Preparing {len(jobs)} file(s) using {engine}...")
+        threading.Thread(target=self._phase1_worker, args=(jobs, engine), daemon=True).start()
 
     # Phase 1 sub-stages, for the "working on X: <stage>" status line. Table
     # detection (Docling) is by far the slowest — it loads ML models on first
@@ -373,7 +382,7 @@ class PDFATaggerApp(ctk.CTk):
     # what turns "looks stuck" into "on Detect Tables (this step is slow)".
     _PHASE1_STAGES = ["Extract", "Detect Tables (slow on first run)", "Merge", "Build AI input"]
 
-    def _phase1_worker(self, jobs):
+    def _phase1_worker(self, jobs, engine):
         total = len(jobs)
         for i, job in enumerate(jobs, 1):
             self.after(0, self._phase1_progress, i - 1, total, job.name, self._PHASE1_STAGES[0])
@@ -399,7 +408,7 @@ class PDFATaggerApp(ctk.CTk):
                 self.after(0, self._phase1_progress, i - 1, total, job.name, self._PHASE1_STAGES[1])
                 regions_json = os.path.join(doc_dir, "regions.json")
                 try:
-                    detect_tables(job.pdf_path, regions_json)
+                    detect_tables(job.pdf_path, regions_json, engine=engine)
                 except Exception:
                     with open(regions_json, "w", encoding="utf-8") as f:
                         json.dump([], f)

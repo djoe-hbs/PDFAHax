@@ -36,3 +36,10 @@ models/
 # OS
 Thumbs.db
 .DS_Store
+
+# Tools / generated output
+verapdf-installer/
+odl_output/
+opendataloader_test/*output*/
+*.png
+mllm_tagger/tmp_*.py

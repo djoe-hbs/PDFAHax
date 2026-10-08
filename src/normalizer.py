@@ -19,7 +19,7 @@ from src.utils import get_timestamp
 # Conservative: only split lines that CLEARLY begin a list item. When in doubt,
 # a line is treated as normal text (better to miss a list than shred a paragraph).
 
-BULLET_CHARS = "•·▪◦○●‣⁃∙◾◽■□*–—"
+BULLET_CHARS = "•·▪◦○●‣⁃∙◾◽■□*–—o"
 SYMBOL_FONTS = ("symbol", "zapfdingbat", "wingding", "webding", "dingbat")
 
 # Inline marker at the very start of a line: a bullet glyph, or a number/letter/
@@ -238,7 +238,20 @@ def normalize_blocks(raw_blocks: list[dict], source_file: str) -> dict:
                     flush_sub()
                     marker, body_text = inline
                     marker_x0 = line["bbox"][0]
-                    body_x0 = line["bbox"][0]
+                    # Calculate true body_x0 from spans
+                    body_x0 = marker_x0
+                    for span in line.get("spans", []):
+                        span_text = span.get("text", "")
+                        if marker in span_text:
+                            continue # Skip the span with the marker
+                        if span_text.strip():
+                            body_x0 = span["bbox"][0]
+                            break
+                    
+                    # Fallback if body_x0 wasn't found in a separate span
+                    if body_x0 == marker_x0:
+                        body_x0 = marker_x0 + 10 # heuristic fallback
+                        
                     item_bbox = list(line["bbox"])
                     fs, fn = _line_font(line)
                     i += 1

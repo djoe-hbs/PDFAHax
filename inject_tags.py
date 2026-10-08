@@ -71,7 +71,7 @@ def tag_name_to_pdf_name(tag: str) -> str:
         "LINK": "Link",
         "NOTE": "Note",
     }
-    return mapping.get(tag.upper(), tag)
+    return mapping.get(tag.upper(), "P")
 
 
 # ── Content Stream Analysis ──────────────────────────────────────────────────
@@ -590,7 +590,7 @@ _BULLET_CHARS = set("•◦▪‣·–—-*●○") | {"�"}
 
 # Default spoken text for a symbol bullet's Lbl/Span. Set to "" to make the
 # screen reader skip the bullet entirely.
-BULLET_ACTUAL_TEXT = "Bullet"
+BULLET_ACTUAL_TEXT = "Bullet "
 
 # Default /Contents (alternate description) written onto a Link annotation that
 # lacks one. Required by PDF/UA 7.18.1 / 7.18.5. Override per-document if richer
@@ -959,13 +959,17 @@ def build_structure_tree(pdf, pages_data, tags_map, blocks_data, toc_links_by_pa
                         mcid_elem[m] = span_elem
 
                 if body_mcids:
-                    lbody_elem = pdf.make_indirect(Dictionary({
-                        "/Type": Name("/StructElem"), "/S": Name("/LBody"), "/K": k_of(body_mcids),
+                    p_elem = pdf.make_indirect(Dictionary({
+                        "/Type": Name("/StructElem"), "/S": Name("/P"), "/K": k_of(body_mcids),
                     }))
+                    lbody_elem = pdf.make_indirect(Dictionary({
+                        "/Type": Name("/StructElem"), "/S": Name("/LBody"), "/K": Array([p_elem]),
+                    }))
+                    p_elem["/P"] = lbody_elem
                     lbody_elem["/P"] = li_elem
                     li_kids.append(lbody_elem)
                     for m in body_mcids:
-                        mcid_elem[m] = lbody_elem
+                        mcid_elem[m] = p_elem
 
                 li_elem["/K"] = Array(li_kids)
                 all_elems[block_id] = li_elem
@@ -1230,7 +1234,7 @@ def build_structure_tree(pdf, pages_data, tags_map, blocks_data, toc_links_by_pa
 
     # Build document hierarchy respecting parent_tag grouping
     doc_kids = []
-    current_list = None
+    list_stack = []
     current_toc = None
     processed_tables = set()
 
@@ -1244,7 +1248,7 @@ def build_structure_tree(pdf, pages_data, tags_map, blocks_data, toc_links_by_pa
 
         # Handle TOC grouping
         if parent_tag and parent_tag.upper() == "TOC":
-            current_list = None
+            list_stack = []
             if current_toc is None:
                 current_toc = pdf.make_indirect(Dictionary({
                     "/Type": Name("/StructElem"),
@@ -1254,45 +1258,104 @@ def build_structure_tree(pdf, pages_data, tags_map, blocks_data, toc_links_by_pa
                 doc_kids.append(current_toc)
             current_toc["/K"].append(elem)
             elem["/P"] = current_toc
-        # Handle List grouping
-        elif tag == "LI" or (parent_tag and parent_tag.upper() == "L"):
+        # Handle List grouping and nested lists automatically via geometry
+        elif tag == "LI":
             current_toc = None
-            if current_list is None:
-                current_list = pdf.make_indirect(Dictionary({
+            body_x0 = blocks_map.get(block_id, {}).get("metadata", {}).get("body_x0", 0)
+            
+            while list_stack and body_x0 < list_stack[-1]["x0"] - 10:
+                list_stack.pop()
+                
+            if not list_stack:
+                new_l = pdf.make_indirect(Dictionary({
                     "/Type": Name("/StructElem"),
                     "/S": Name("/L"),
                     "/K": Array([]),
                 }))
-                doc_kids.append(current_list)
-            current_list["/K"].append(elem)
-            elem["/P"] = current_list
-        elif tag == "L":
-            current_toc = None
-            current_list = None
-            doc_kids.append(elem)
-        # Handle Table grouping: build the whole Table -> TR -> TH/TD subtree once,
-        # at the position of its first cell, with cells sorted by (row, col).
+                doc_kids.append(new_l)
+                list_stack.append({"L": new_l, "x0": body_x0, "last_li": elem})
+                new_l["/K"].append(elem)
+                elem["/P"] = new_l
+            else:
+                if body_x0 > list_stack[-1]["x0"] + 10:
+                    new_l = pdf.make_indirect(Dictionary({
+                        "/Type": Name("/StructElem"),
+                        "/S": Name("/L"),
+                        "/K": Array([]),
+                    }))
+                    parent_li = list_stack[-1]["last_li"]
+                    
+                    lbody = None
+                    if "/K" in parent_li:
+                        for k in parent_li["/K"]:
+                            if isinstance(k, pikepdf.Dictionary) and k.get("/S") == "/LBody":
+                                lbody = k
+                                break
+                    if not lbody:
+                        lbody = parent_li
+                        
+                    if "/K" not in lbody:
+                        lbody["/K"] = Array()
+                    elif not isinstance(lbody["/K"], pikepdf.Array):
+                        lbody["/K"] = Array([lbody["/K"]])
+                    
+                    lbody["/K"].append(new_l)
+                    new_l["/P"] = lbody
+                    
+                    list_stack.append({"L": new_l, "x0": body_x0, "last_li": elem})
+                    new_l["/K"].append(elem)
+                    elem["/P"] = new_l
+                else:
+                    cur_l = list_stack[-1]["L"]
+                    cur_l["/K"].append(elem)
+                    elem["/P"] = cur_l
+                    list_stack[-1]["last_li"] = elem
+        elif tag == "P" and list_stack:
+            # Check if this P is a continuation of a list item
+            p_x0 = blocks_map.get(block_id, {}).get("bbox", [0])[0]
+            matched = False
+            for level in reversed(list_stack):
+                if abs(p_x0 - level["x0"]) < 15:
+                    parent_li = level["last_li"]
+                    lbody = None
+                    if "/K" in parent_li:
+                        for k in parent_li["/K"]:
+                            if isinstance(k, pikepdf.Dictionary) and k.get("/S") == "/LBody":
+                                lbody = k
+                                break
+                    if not lbody:
+                        lbody = parent_li
+                        
+                    if "/K" not in lbody:
+                        lbody["/K"] = Array()
+                    elif not isinstance(lbody["/K"], pikepdf.Array):
+                        lbody["/K"] = Array([lbody["/K"]])
+                    
+                    lbody["/K"].append(elem)
+                    elem["/P"] = lbody
+                    matched = True
+                    break
+            
+            if matched:
+                current_toc = None
+                continue
+            else:
+                list_stack = []
+                current_toc = None
+                doc_kids.append(elem)
+        # Handle Table grouping
         elif tag in ("TH", "TD"):
-            current_list = None
+            list_stack = []
             current_toc = None
             t_id = blocks_map.get(block_id, {}).get("table_id", -1)
             if t_id in processed_tables:
-                continue  # remaining cells of this table already placed
+                continue
             processed_tables.add(t_id)
             table_elem = build_table_subtree(t_id)
             doc_kids.append(table_elem)
         elif tag == "REFERENCE":
-            current_list = None
+            list_stack = []
             current_toc = None
-            # Gold-standard target: Reference is a CHILD of the surrounding
-            # paragraph's <P>, inline at the point in reading order where the
-            # superscript marker sits — NOT a sibling hoisted to Document level.
-            # The AI tagged the whole source paragraph as one block_id (the
-            # marker/prose split is superscript-glyph precision inside the
-            # content stream, not a document-structure split), so para_elem's
-            # own body MCID(s) already read as the sentence; appending elem
-            # (Reference) after them places the marker exactly where it trails
-            # that sentence.
             para_elem = reference_para_elems.get(block_id)
             if para_elem is not None:
                 existing_k = para_elem["/K"]
@@ -1300,21 +1363,15 @@ def build_structure_tree(pdf, pages_data, tags_map, blocks_data, toc_links_by_pa
                 para_kids.append(elem)
                 para_elem["/K"] = Array(para_kids)
                 elem["/P"] = para_elem
-                doc_kids.append(para_elem)  # /P (Document) set below, for para_elem only
+                doc_kids.append(para_elem)
             else:
-                # No surrounding-prose sibling was split out (e.g. the marker
-                # was the block's only content) — degrade safely to the old
-                # Document-level placement rather than lose the Reference.
                 doc_kids.append(elem)
         elif tag == "NOTE" and block_id in notes_nested_in_reference:
-            # Already re-parented inside its Reference (as a sibling of Link)
-            # when the footnote link was built above — do not ALSO hoist it to
-            # Document level, which would double-place the same struct_elem.
-            current_list = None
+            list_stack = []
             current_toc = None
             continue
         else:
-            current_list = None
+            list_stack = []
             current_toc = None
             doc_kids.append(elem)
 
@@ -1326,15 +1383,23 @@ def build_structure_tree(pdf, pages_data, tags_map, blocks_data, toc_links_by_pa
     for _annot, link_elem, _page in link_records:
         doc_kids.append(link_elem)
 
-    # Create Document element
-    doc_elem = pdf.make_indirect(Dictionary({
+    # Create Sect wrapper
+    sect_elem = pdf.make_indirect(Dictionary({
         "/Type": Name("/StructElem"),
-        "/S": Name("/Document"),
+        "/S": Name("/Sect"),
         "/K": Array(doc_kids),
     }))
 
     for kid in doc_kids:
-        kid["/P"] = doc_elem
+        kid["/P"] = sect_elem
+
+    # Create Document element
+    doc_elem = pdf.make_indirect(Dictionary({
+        "/Type": Name("/StructElem"),
+        "/S": Name("/Document"),
+        "/K": Array([sect_elem]),
+    }))
+    sect_elem["/P"] = doc_elem
 
     # Build ParentTree (NumberTree) — one entry per page
     nums_array = Array([])
